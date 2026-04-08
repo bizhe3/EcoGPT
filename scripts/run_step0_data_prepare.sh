@@ -1,55 +1,119 @@
 #!/bin/bash
 # ============================================================
-# EcoGPT Step 0: Data Preparation Pipeline
+# EcoGPT Step 0: Data Preparation Pipeline (Full)
 # ============================================================
-# This script processes raw financial SFT data into training format.
-# Run each step sequentially.
+# 完整的数据处理流水线，从原始数据到可训练数据。
+# 按顺序执行每一步。
+#
+# 前置条件:
+#   - 已执行 run_download_data.sh 下载原始数据
+#   - 已执行 run_translate.sh 翻译英文数据 (如需)
+#   - 已执行 run_self_qa.sh 生成 Self-QA 数据 (如需)
+#   - 评测数据已放入 data/eval/ 目录
 
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="${PROJECT_ROOT}/data"
 SCRIPTS="${PROJECT_ROOT}/scripts"
+PROCESSED="${DATA_DIR}/sft/processed"
+TOKENIZER="${PROJECT_ROOT}/models/base/Qwen2.5-7B-Instruct"
+
+mkdir -p "${PROCESSED}"
 
 echo "============================================"
 echo "  EcoGPT Step 0: Data Preparation"
 echo "============================================"
 
-# --- Step 0.1: Format conversion (Alpaca → conversations) ---
-echo "[Step 0.1] Converting Alpaca format to conversations..."
-python "${SCRIPTS}/data_processing/apaca2conversation.py" \
-    --input "${DATA_DIR}/sft/raw/your_alpaca_data.json" \
-    --output_dir "${DATA_DIR}/sft/processed"
+# --- Step 0.1: BAAI 数据集质量过滤 ---
+echo ""
+echo "[Step 0.1] Filtering BAAI IndustryInstruction by quality scores..."
+echo "           deita_score >= 5.0, rw_score >= 0.0"
+python "${SCRIPTS}/data_processing/filter_baai.py" \
+    --input "${DATA_DIR}/sft/raw/baai_finance" \
+    --output "${PROCESSED}/baai_finance.jsonl" \
+    --min_deita_score 5.0 \
+    --min_rw_score 0.0 \
+    --min_turns 2 \
+    --min_answer_len 20
 
-# --- Step 0.2: Deduplication ---
-echo "[Step 0.2] Running deduplication..."
-# Edit check2.py DATA_PATH before running, or use the decontaminate script
-# python "${SCRIPTS}/data_processing/check2.py"
+# --- Step 0.2: 格式转换 (如有 Alpaca 格式数据) ---
+echo ""
+echo "[Step 0.2] Converting Alpaca format to conversations..."
+if [ -f "${DATA_DIR}/sft/raw/finance_alpaca/data.json" ]; then
+    python "${SCRIPTS}/data_processing/apaca2conversation.py" \
+        --input "${DATA_DIR}/sft/raw/finance_alpaca/data.json" \
+        --output_dir "${PROCESSED}"
+else
+    echo "  [SKIP] No Alpaca data found, skipping conversion"
+fi
 
-# --- Step 0.3: Token length filtering ---
-echo "[Step 0.3] Filtering by token length..."
-# Edit data_filter.py paths before running
-# python "${SCRIPTS}/data_processing/data_filter.py"
+# --- Step 0.3: 多源合并 (按配比采样) ---
+echo ""
+echo "[Step 0.3] Merging SFT datasets with target ratios..."
+python "${SCRIPTS}/data_processing/merge_sft_data.py" \
+    --sources \
+        "baai_finance:${PROCESSED}/baai_finance.jsonl:0.40" \
+        "self_qa:${PROCESSED}/self_qa.jsonl:0.25" \
+        "alpaca_zh:${PROCESSED}/finance_alpaca_zh.jsonl:0.15" \
+        "sujet_zh:${PROCESSED}/sujet_finance_zh.jsonl:0.10" \
+        "sentiment:${PROCESSED}/fingpt_sentiment.jsonl:0.10" \
+    --total 200000 \
+    --output "${PROCESSED}/merged_sft.jsonl" \
+    --seed 42
 
-# --- Step 0.4: Decontamination (train vs eval) ---
-echo "[Step 0.4] Decontaminating against eval benchmarks..."
+# --- Step 0.4: 去重分析 ---
+echo ""
+echo "[Step 0.4] Running deduplication analysis..."
+python "${SCRIPTS}/data_processing/check2.py" \
+    --data "${PROCESSED}/merged_sft.jsonl" \
+    --out_dir "${PROJECT_ROOT}/outputs/dup_report" \
+    --threshold 0.9
+
+# --- Step 0.5: Token 长度过滤 ---
+echo ""
+echo "[Step 0.5] Filtering by token length..."
+if [ -d "${TOKENIZER}" ]; then
+    python "${SCRIPTS}/data_processing/data_filter.py" \
+        --input "${PROCESSED}/merged_sft.jsonl" \
+        --output "${PROCESSED}/merged_sft_filtered.jsonl" \
+        --tokenizer "${TOKENIZER}" \
+        --max_total_tokens 2048 \
+        --min_total_tokens 10
+else
+    echo "  [SKIP] Tokenizer not found at ${TOKENIZER}, skipping length filter"
+    cp "${PROCESSED}/merged_sft.jsonl" "${PROCESSED}/merged_sft_filtered.jsonl"
+fi
+
+# --- Step 0.6: 评测集去污染 ---
+echo ""
+echo "[Step 0.6] Decontaminating against eval benchmarks..."
 python "${SCRIPTS}/data_processing/decontaminate.py" \
-    --train_dir "${DATA_DIR}/sft/processed" \
+    --train_dir "${PROCESSED}/merged_sft_filtered.jsonl" \
     --eval_dirs "${DATA_DIR}/eval/financeiq,${DATA_DIR}/eval/fineval,${DATA_DIR}/eval/ceval_finance,${DATA_DIR}/eval/disc_fin_eval" \
     --threshold 0.7 \
-    --output_dir "${DATA_DIR}/sft/processed" \
+    --output_dir "${PROCESSED}" \
     --report_path "${DATA_DIR}/sft/contamination_report.json"
 
-# --- Step 0.5: Train/Val split ---
-echo "[Step 0.5] Splitting train/val..."
+# --- Step 0.7: 训练/验证集划分 ---
+echo ""
+echo "[Step 0.7] Splitting train/val (95/5)..."
 python "${SCRIPTS}/data_processing/data_split.py" \
-    --in "${DATA_DIR}/sft/processed/train_clean.jsonl" \
+    --in "${PROCESSED}/train_clean.jsonl" \
     --out_dir "${DATA_DIR}/sft" \
     --valid_ratio 0.05 \
     --seed 42
 
+# --- Summary ---
 echo ""
-echo "Data preparation complete!"
-echo "  Train: ${DATA_DIR}/sft/train/"
-echo "  Val:   ${DATA_DIR}/sft/val/"
-echo "  Report: ${DATA_DIR}/sft/contamination_report.json"
+echo "============================================"
+echo "  Step 0 Complete!"
+echo "============================================"
+TRAIN_COUNT=$(wc -l < "${DATA_DIR}/sft/train.jsonl" 2>/dev/null || echo "?")
+VAL_COUNT=$(wc -l < "${DATA_DIR}/sft/valid.jsonl" 2>/dev/null || echo "?")
+echo "  Train samples:    ${TRAIN_COUNT}"
+echo "  Val samples:      ${VAL_COUNT}"
+echo "  Contamination:    ${DATA_DIR}/sft/contamination_report.json"
+echo "  Dup report:       ${PROJECT_ROOT}/outputs/dup_report/"
+echo ""
+echo "  Next: bash scripts/run_step1_sft.sh"
