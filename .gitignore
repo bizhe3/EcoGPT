@@ -1,3 +1,6 @@
+# Keep directory structure (override ignores below)
+!**/.gitkeep
+
 # Models & checkpoints
 models/base/
 models/sft_lora/
