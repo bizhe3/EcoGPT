@@ -127,8 +127,11 @@ def extract_instruction_output(item: dict) -> Optional[tuple]:
 
 def parse_translation(response: str) -> Optional[tuple]:
     """Parse translated question and answer from LLM response."""
-    # Strip Qwen3 thinking tags if present
-    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+    # Strip Qwen3 thinking content (handle missing opening <think> tag)
+    if '</think>' in response:
+        response = response.split('</think>')[-1].strip()
+    else:
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
 
     # Try to find "问题：" and "回答：" markers
     q_match = re.search(r'问题[：:]\s*(.*?)(?=\n*回答[：:]|\Z)', response, re.DOTALL)
@@ -303,7 +306,7 @@ def main():
             parsed = parse_translation(resp)
             if parsed:
                 zh_q, zh_a = parsed
-                if len(zh_q) > 5 and len(zh_a) > 10:
+                if len(zh_q) > 5 and len(zh_a) > 1:
                     translated.append({"conversations": [
                         {"from": "human", "value": zh_q},
                         {"from": "gpt", "value": zh_a},
@@ -323,7 +326,7 @@ def main():
                 parsed = parse_translation(resp)
                 if parsed:
                     zh_q, zh_a = parsed
-                    if len(zh_q) > 5 and len(zh_a) > 10:
+                    if len(zh_q) > 5 and len(zh_a) > 1:
                         translated.append({"conversations": [
                             {"from": "human", "value": zh_q},
                             {"from": "gpt", "value": zh_a},
