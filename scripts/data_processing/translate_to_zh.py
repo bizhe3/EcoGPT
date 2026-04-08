@@ -57,18 +57,22 @@ def load_data(path: str) -> list:
     if os.path.isdir(path):
         files = glob(os.path.join(path, "**/*.jsonl"), recursive=True) + \
                 glob(os.path.join(path, "**/*.json"), recursive=True) + \
-                glob(os.path.join(path, "**/*.parquet"), recursive=True)
+                glob(os.path.join(path, "**/*.parquet"), recursive=True) + \
+                glob(os.path.join(path, "**/*.csv"), recursive=True)
     else:
         files = [path]
 
     for fpath in files:
-        if fpath.endswith(".parquet"):
+        if fpath.endswith(".parquet") or fpath.endswith(".csv"):
             try:
                 import pandas as pd
-                df = pd.read_parquet(fpath)
+                if fpath.endswith(".parquet"):
+                    df = pd.read_parquet(fpath)
+                else:
+                    df = pd.read_csv(fpath)
                 items.extend(df.to_dict("records"))
             except ImportError:
-                logger.warning(f"pandas/pyarrow needed for parquet: {fpath}")
+                logger.warning(f"pandas needed for {fpath}")
             continue
 
         with open(fpath, "r", encoding="utf-8") as f:
