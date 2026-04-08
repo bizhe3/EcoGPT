@@ -1,0 +1,56 @@
+# Models & checkpoints
+models/base/
+models/sft_lora/
+models/sft_merged/
+models/grpo_lora/
+models/grpo_merged/
+models/reward_model/
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Datasets
+data/sft/raw/
+data/sft/processed/
+data/sft/train/
+data/sft/val/
+data/grpo/raw/
+data/grpo/processed/
+data/grpo/train/
+data/grpo/val/
+data/eval/
+data/pretrain/
+
+# Outputs & logs
+outputs/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
