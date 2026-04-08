@@ -10,5 +10,5 @@
 #   pip install -r requirements.txt
 
 torch==2.5.1
-vllm==0.6.6
+vllm==0.6.6.post1
 # flash-attn==2.7.2  # 单独安装: pip install flash-attn==2.7.2 --no-build-isolation

@@ -12,5 +12,5 @@
 # Note: RTX PRO 6000 NVLink 双卡 = 192GB, 72B bf16 放得下 (tp=2)
 
 torch==2.6.0
-vllm>=0.7.0
+vllm==0.7.3
 # flash-attn>=2.8.0  # 单独安装: pip install flash-attn --no-build-isolation
