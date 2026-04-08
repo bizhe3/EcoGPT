@@ -127,24 +127,32 @@ def extract_instruction_output(item: dict) -> Optional[tuple]:
 
 def parse_translation(response: str) -> Optional[tuple]:
     """Parse translated question and answer from LLM response."""
-    # Strip Qwen3 thinking content (handle missing opening <think> tag)
+    # Strip Qwen3 thinking content
     if '</think>' in response:
         response = response.split('</think>')[-1].strip()
-    else:
-        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+    # Also strip thinking patterns without tags (Chinese thinking phrases)
+    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
 
-    # Try to find "问题：" and "回答：" markers
-    q_match = re.search(r'问题[：:]\s*(.*?)(?=\n*回答[：:]|\Z)', response, re.DOTALL)
-    a_match = re.search(r'回答[：:]\s*(.*)', response, re.DOTALL)
+    # Find the LAST occurrence of "问题：...回答：..." to skip any repeated content
+    all_q = list(re.finditer(r'问题[：:]\s*(.*?)(?=\n*回答[：:])', response, re.DOTALL))
+    all_a = list(re.finditer(r'回答[：:]\s*(.*?)(?=\n*问题[：:]|\Z)', response, re.DOTALL))
 
-    if q_match and a_match:
-        return q_match.group(1).strip(), a_match.group(1).strip()
+    if all_q and all_a:
+        # Use the FIRST clean pair (before any repetition starts)
+        q_text = all_q[0].group(1).strip()
+        a_text = all_a[0].group(1).strip()
+        # Strip any trailing thinking/repetition from answer
+        a_text = re.split(r'\n(?:好的|首先|接下来|然后|最后|检查|确认|用户|原文)', a_text)[0].strip()
+        if q_text and a_text:
+            return q_text, a_text
 
     # Fallback: split by first double newline
     parts = response.strip().split("\n\n", 1)
     if len(parts) == 2:
         q = re.sub(r'^问题[：:]\s*', '', parts[0]).strip()
         a = re.sub(r'^回答[：:]\s*', '', parts[1]).strip()
+        # Strip trailing thinking from answer
+        a = re.split(r'\n(?:好的|首先|接下来|然后|最后|检查|确认|用户|原文)', a)[0].strip()
         if q and a:
             return q, a
 
@@ -281,6 +289,8 @@ def main():
             max_model_len=4096,
         )
         vllm_params = SamplingParams(temperature=0.3, max_tokens=args.max_tokens)
+        # Build prompts using chat template to disable Qwen3 thinking mode
+        vllm_tokenizer = vllm_engine.get_tokenizer()
         logger.info("vLLM engine ready")
     elif args.mode == "local_hf":
         import torch
@@ -294,9 +304,25 @@ def main():
 
     # Translate in batches
     translated = []
-    all_prompts = [TRANSLATE_PROMPT.format(instruction=instr, output=out) for _, instr, out in to_translate]
 
     if args.mode == "local_vllm":
+        # Build chat-formatted prompts to disable Qwen3 thinking mode
+        all_prompts = []
+        for _, instr, out in to_translate:
+            user_msg = TRANSLATE_PROMPT.format(instruction=instr, output=out)
+            messages = [{"role": "user", "content": user_msg}]
+            try:
+                prompt = vllm_tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,  # Disable Qwen3 thinking mode
+                )
+            except TypeError:
+                # Fallback for models without enable_thinking parameter
+                prompt = vllm_tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+            all_prompts.append(prompt)
+
         # vLLM: single call with all prompts (continuous batching handles internally)
         logger.info(f"Generating {len(all_prompts)} translations with vLLM...")
         outputs = vllm_engine.generate(all_prompts, vllm_params)
@@ -313,9 +339,10 @@ def main():
                     ]})
     else:
         # HF / API: process in batches
+        all_prompts = [TRANSLATE_PROMPT.format(instruction=instr, output=out) for _, instr, out in to_translate]
         for batch_start in range(0, len(to_translate), args.batch_size):
             batch = to_translate[batch_start:batch_start + args.batch_size]
-            prompts = [TRANSLATE_PROMPT.format(instruction=instr, output=out) for _, instr, out in batch]
+            prompts = all_prompts[batch_start:batch_start + args.batch_size]
 
             if args.mode == "local_hf":
                 responses = translate_batch_hf(prompts, args.model, args.max_tokens)
