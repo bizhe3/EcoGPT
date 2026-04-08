@@ -127,6 +127,9 @@ def extract_instruction_output(item: dict) -> Optional[tuple]:
 
 def parse_translation(response: str) -> Optional[tuple]:
     """Parse translated question and answer from LLM response."""
+    # Strip Qwen3 thinking tags if present
+    response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL).strip()
+
     # Try to find "问题：" and "回答：" markers
     q_match = re.search(r'问题[：:]\s*(.*?)(?=\n*回答[：:]|\Z)', response, re.DOTALL)
     a_match = re.search(r'回答[：:]\s*(.*)', response, re.DOTALL)
