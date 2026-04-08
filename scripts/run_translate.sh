@@ -2,53 +2,70 @@
 # ============================================================
 # EcoGPT - Translate English Financial Data to Chinese
 # ============================================================
-# Translates finance-alpaca and Sujet-Finance datasets.
-# Requires a local LLM (Qwen2.5-72B recommended).
+# 14B 双实例并行翻译 (2×A100 80G, 各占 1 卡)
+# 预计耗时: ~8.3 小时 (60K 条)
 #
-# 如果没有 72B 模型的 GPU 资源，可以：
-#   1. 用 Qwen2.5-7B-Instruct (质量较低但可用)
-#   2. 启动 vLLM server 后用 api 模式
-#   3. 用第三方翻译 API
+# 翻译用 14B 原因: 有英文原文锚定, 14B 质量够用
+# Self-QA 用 72B 原因: 无原文, 完全靠模型金融知识
 
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROCESSED="${PROJECT_ROOT}/data/sft/processed"
+mkdir -p "${PROCESSED}"
 
-# ---- 配置 (EDIT THESE) ----
-MODEL="Qwen/Qwen2.5-72B-Instruct"   # 或本地路径
-MODE="local_vllm"                     # local_vllm / local_hf / api
-API_BASE="http://localhost:8000/v1"   # api 模式用
+MODEL="Qwen/Qwen2.5-14B-Instruct"
+MODE="local_vllm"
 BATCH_SIZE=64
+TP=1
+GPU_UTIL=0.90
 
 echo "============================================"
-echo "  EcoGPT: Translate EN → ZH"
+echo "  EcoGPT: Translate EN → ZH (14B × 2 实例)"
 echo "============================================"
-
-# 1. Finance-Alpaca (69K)
+echo "  Model:    ${MODEL}"
+echo "  Strategy: 2 parallel vLLM instances (GPU 0 & GPU 1)"
 echo ""
-echo "[1/2] Translating finance-alpaca..."
-python "${PROJECT_ROOT}/scripts/data_processing/translate_to_zh.py" \
+
+# 实例 0: finance-alpaca → GPU 0
+echo "[Instance 0] finance-alpaca (30K) → GPU 0"
+CUDA_VISIBLE_DEVICES=0 python "${PROJECT_ROOT}/scripts/data_processing/translate_to_zh.py" \
     --input "${PROJECT_ROOT}/data/sft/raw/finance_alpaca" \
-    --output "${PROJECT_ROOT}/data/sft/processed/finance_alpaca_zh.jsonl" \
+    --output "${PROCESSED}/finance_alpaca_zh.jsonl" \
     --model "${MODEL}" \
     --mode "${MODE}" \
-    --api_base "${API_BASE}" \
     --batch_size ${BATCH_SIZE} \
-    --max_samples 30000
+    --tensor_parallel ${TP} \
+    --gpu_utilization ${GPU_UTIL} \
+    --max_samples 30000 &
+PID_0=$!
 
-# 2. Sujet-Finance (177K → 取 30K)
-echo ""
-echo "[2/2] Translating Sujet-Finance (sampling 30K)..."
-python "${PROJECT_ROOT}/scripts/data_processing/translate_to_zh.py" \
+# 实例 1: Sujet-Finance → GPU 1
+echo "[Instance 1] Sujet-Finance (30K) → GPU 1"
+CUDA_VISIBLE_DEVICES=1 python "${PROJECT_ROOT}/scripts/data_processing/translate_to_zh.py" \
     --input "${PROJECT_ROOT}/data/sft/raw/sujet_finance" \
-    --output "${PROJECT_ROOT}/data/sft/processed/sujet_finance_zh.jsonl" \
+    --output "${PROCESSED}/sujet_finance_zh.jsonl" \
     --model "${MODEL}" \
     --mode "${MODE}" \
-    --api_base "${API_BASE}" \
     --batch_size ${BATCH_SIZE} \
-    --max_samples 30000
+    --tensor_parallel ${TP} \
+    --gpu_utilization ${GPU_UTIL} \
+    --max_samples 30000 &
+PID_1=$!
 
 echo ""
-echo "Translation complete!"
-echo "  ${PROJECT_ROOT}/data/sft/processed/finance_alpaca_zh.jsonl"
-echo "  ${PROJECT_ROOT}/data/sft/processed/sujet_finance_zh.jsonl"
+echo "Waiting for both instances..."
+FAIL=0
+wait ${PID_0} || { echo "[FAIL] Instance 0 failed"; FAIL=1; }
+wait ${PID_1} || { echo "[FAIL] Instance 1 failed"; FAIL=1; }
+
+if [ ${FAIL} -eq 0 ]; then
+    echo ""
+    echo "Translation complete!"
+    echo "  ${PROCESSED}/finance_alpaca_zh.jsonl"
+    echo "  ${PROCESSED}/sujet_finance_zh.jsonl"
+    echo ""
+    echo "Next: bash scripts/run_self_qa.sh"
+else
+    exit 1
+fi

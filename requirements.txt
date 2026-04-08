@@ -1,26 +1,45 @@
 # EcoGPT - Dependencies
+# Python 3.10 required for both configurations.
+#
+# ================================================================
+#   Configuration A: 2×A100 80G (Ampere, CUDA 12.4)
+# ================================================================
+#   conda create -n ecogpt python=3.10 -y && conda activate ecogpt
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+#   pip install flash-attn==2.7.2 --no-build-isolation
+#   pip install -r requirements-a100.txt
+#
+# ================================================================
+#   Configuration B: 2×RTX PRO 6000 96G (Blackwell, CUDA 12.8)
+# ================================================================
+#   conda create -n ecogpt python=3.10 -y && conda activate ecogpt
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu128
+#   pip install flash-attn --no-build-isolation
+#   pip install -r requirements-rtxpro.txt
+#
+# ================================================================
+#   共用依赖 (安装任一 requirements-*.txt 后, 再安装此文件)
+# ================================================================
+
 # Core
-torch>=2.1.0
-transformers>=4.45.0
-datasets>=2.18.0
-peft>=0.12.0
-trl>=0.15.0
-accelerate>=0.34.0
+transformers==4.46.3
+datasets==2.21.0
+peft==0.13.2
+trl==0.15.0
+accelerate==0.35.0
 
 # Training
-bitsandbytes>=0.43.0
-flash-attn>=2.5.0
-deepspeed>=0.14.0
+bitsandbytes==0.44.1
+deepspeed==0.15.4
 
 # Data processing
-datasketch>=1.6.0
+datasketch==1.6.5
 loguru>=0.7.0
 scikit-learn>=1.3.0
 tqdm>=4.65.0
 sentence-transformers>=2.2.0
+pandas>=2.0.0
+pyarrow>=14.0.0
 
 # Evaluation
-lm-eval>=0.4.0
-
-# Optional: Fast rollout for GRPO
-# vllm>=0.6.0
+lm-eval==0.4.6

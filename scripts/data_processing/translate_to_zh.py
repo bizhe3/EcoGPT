@@ -141,9 +141,17 @@ def parse_translation(response: str) -> Optional[tuple]:
     return None
 
 
-def translate_batch_vllm(prompts: List[str], model_path: str, max_tokens: int) -> List[str]:
+def translate_batch_vllm(prompts: List[str], model_path: str, max_tokens: int,
+                         tensor_parallel: int = 4, gpu_utilization: float = 0.90) -> List[str]:
     from vllm import LLM, SamplingParams
-    llm = LLM(model_path, trust_remote_code=True, dtype="bfloat16")
+    llm = LLM(
+        model_path,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        tensor_parallel_size=tensor_parallel,
+        gpu_memory_utilization=gpu_utilization,
+        max_model_len=4096,
+    )
     params = SamplingParams(temperature=0.3, max_tokens=max_tokens)
     outputs = llm.generate(prompts, params)
     return [o.outputs[0].text for o in outputs]
@@ -206,6 +214,10 @@ def main():
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--max_tokens", type=int, default=2048)
     ap.add_argument("--max_samples", type=int, default=None, help="Limit input samples")
+    ap.add_argument("--tensor_parallel", type=int, default=4,
+                    help="vLLM tensor parallel size (number of GPUs)")
+    ap.add_argument("--gpu_utilization", type=float, default=0.90,
+                    help="vLLM GPU memory utilization ratio")
     ap.add_argument("--skip_chinese", action="store_true", default=True,
                     help="Skip already-Chinese samples (pass through directly)")
     args = ap.parse_args()
@@ -241,20 +253,46 @@ def main():
     logger.info(f"Chinese passthrough: {len(chinese_passthrough)}")
     logger.info(f"To translate: {len(to_translate)}")
 
+    # Initialize model once (outside loop)
+    vllm_engine = None
+    vllm_params = None
+    hf_model = None
+    hf_tokenizer = None
+
+    if args.mode == "local_vllm":
+        from vllm import LLM, SamplingParams
+        logger.info(f"Loading vLLM engine: {args.model} (tp={args.tensor_parallel}, gpu_util={args.gpu_utilization})")
+        vllm_engine = LLM(
+            args.model,
+            trust_remote_code=True,
+            dtype="bfloat16",
+            tensor_parallel_size=args.tensor_parallel,
+            gpu_memory_utilization=args.gpu_utilization,
+            max_model_len=4096,
+        )
+        vllm_params = SamplingParams(temperature=0.3, max_tokens=args.max_tokens)
+        logger.info("vLLM engine ready")
+    elif args.mode == "local_hf":
+        import torch
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        logger.info(f"Loading HF model: {args.model}")
+        hf_tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            args.model, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="auto"
+        ).eval()
+        logger.info("HF model ready")
+
     # Translate in batches
     translated = []
-    for batch_start in range(0, len(to_translate), args.batch_size):
-        batch = to_translate[batch_start:batch_start + args.batch_size]
-        prompts = [TRANSLATE_PROMPT.format(instruction=instr, output=out) for _, instr, out in batch]
+    all_prompts = [TRANSLATE_PROMPT.format(instruction=instr, output=out) for _, instr, out in to_translate]
 
-        if args.mode == "local_vllm":
-            responses = translate_batch_vllm(prompts, args.model, args.max_tokens)
-        elif args.mode == "local_hf":
-            responses = translate_batch_hf(prompts, args.model, args.max_tokens)
-        elif args.mode == "api":
-            responses = translate_batch_api(prompts, args.model, args.api_base, args.api_key, args.max_tokens)
+    if args.mode == "local_vllm":
+        # vLLM: single call with all prompts (continuous batching handles internally)
+        logger.info(f"Generating {len(all_prompts)} translations with vLLM...")
+        outputs = vllm_engine.generate(all_prompts, vllm_params)
+        responses = [o.outputs[0].text for o in outputs]
 
-        for (_, orig_instr, orig_out), resp in zip(batch, responses):
+        for (_, orig_instr, orig_out), resp in zip(to_translate, responses):
             parsed = parse_translation(resp)
             if parsed:
                 zh_q, zh_a = parsed
@@ -263,9 +301,29 @@ def main():
                         {"from": "human", "value": zh_q},
                         {"from": "gpt", "value": zh_a},
                     ]})
+    else:
+        # HF / API: process in batches
+        for batch_start in range(0, len(to_translate), args.batch_size):
+            batch = to_translate[batch_start:batch_start + args.batch_size]
+            prompts = [TRANSLATE_PROMPT.format(instruction=instr, output=out) for _, instr, out in batch]
 
-        done = min(batch_start + args.batch_size, len(to_translate))
-        logger.info(f"Translated {done}/{len(to_translate)}, success: {len(translated)}")
+            if args.mode == "local_hf":
+                responses = translate_batch_hf(prompts, args.model, args.max_tokens)
+            elif args.mode == "api":
+                responses = translate_batch_api(prompts, args.model, args.api_base, args.api_key, args.max_tokens)
+
+            for (_, orig_instr, orig_out), resp in zip(batch, responses):
+                parsed = parse_translation(resp)
+                if parsed:
+                    zh_q, zh_a = parsed
+                    if len(zh_q) > 5 and len(zh_a) > 10:
+                        translated.append({"conversations": [
+                            {"from": "human", "value": zh_q},
+                            {"from": "gpt", "value": zh_a},
+                        ]})
+
+            done = min(batch_start + args.batch_size, len(to_translate))
+            logger.info(f"Translated {done}/{len(to_translate)}, success: {len(translated)}")
 
     # Merge and save
     all_data = chinese_passthrough + translated

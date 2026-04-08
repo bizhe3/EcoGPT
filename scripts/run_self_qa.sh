@@ -1,51 +1,130 @@
 #!/bin/bash
 # ============================================================
-# EcoGPT - Self-QA Data Generation
+# EcoGPT - Self-QA Data Generation (14B ×2 实例, 2×A100 80G)
 # ============================================================
-# Generate financial instruction data from raw corpus using LLM.
-# Inspired by XuanYuan's Self-QA methodology.
+# 全程 14B 方案: 翻译 + Self-QA 都用 14B, 节省时间
+# 预计耗时: ~2.4h (5K段落 → ~15K QA, 双实例并行)
+#
+# 注意: 14B Self-QA 幻觉率较高 (~15-20%)
+# 脚本会在生成后自动运行 filter_self_qa.py 做一致性过滤
 #
 # Prerequisites:
-#   1. Download FinCorpus: huggingface-cli download Duxiaoman-DI/FinCorpus --repo-type dataset
-#   2. Or prepare your own financial text corpus as jsonl with "text" field
-#   3. Start a local vLLM server, or use local_hf / api mode
+#   1. FinCorpus fin_exam 已下载并解压
+#   2. gunzip data/sft/raw/fincorpus/fin_exam.jsonl.gz
 
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROCESSED="${PROJECT_ROOT}/data/sft/processed"
+mkdir -p "${PROCESSED}"
 
-# ---- Paths (EDIT THESE) ----
-INPUT="${PROJECT_ROOT}/data/sft/raw/fincorpus_sample.jsonl"
-OUTPUT="${PROJECT_ROOT}/data/sft/processed/self_qa.jsonl"
-MODEL="Qwen/Qwen2.5-72B-Instruct"  # or local path
+INPUT="${PROJECT_ROOT}/data/sft/raw/fincorpus/fin_exam.jsonl"
+OUTPUT="${PROCESSED}/self_qa_raw.jsonl"
+FILTERED="${PROCESSED}/self_qa.jsonl"
 
-# Generation mode: local_vllm (fastest), local_hf (no vllm needed), api (remote)
+MODEL="Qwen/Qwen2.5-14B-Instruct"
 MODE="local_vllm"
-
-# API settings (only for api mode)
-API_BASE="http://localhost:8000/v1"
-API_KEY="dummy"
+TP=1
+GPU_UTIL=0.90
 
 echo "============================================"
-echo "  EcoGPT: Self-QA Data Generation"
+echo "  EcoGPT: Self-QA Generation (14B ×2)"
 echo "============================================"
 echo "  Input:  ${INPUT}"
-echo "  Output: ${OUTPUT}"
 echo "  Model:  ${MODEL}"
-echo "  Mode:   ${MODE}"
 echo ""
 
-python "${PROJECT_ROOT}/scripts/data_processing/self_qa_generate.py" \
+# =============================================
+# Phase 1: 生成 (双实例并行)
+# =============================================
+# 将语料分成两半, 各占一张卡
+HALF=$(( 5000 / 2 ))
+
+echo "[Phase 1] Generating QA pairs (2 instances parallel)..."
+
+CUDA_VISIBLE_DEVICES=0 python "${PROJECT_ROOT}/scripts/data_processing/self_qa_generate.py" \
     --input "${INPUT}" \
-    --output "${OUTPUT}" \
+    --output "${PROCESSED}/self_qa_raw_part0.jsonl" \
     --model "${MODEL}" \
     --mode "${MODE}" \
-    --api_base "${API_BASE}" \
-    --api_key "${API_KEY}" \
     --text_field "text" \
     --num_questions 3 \
-    --max_samples 5000 \
+    --max_samples ${HALF} \
     --include_reasoning \
     --temperature 0.7 \
     --batch_size 32 \
-    --seed 42
+    --tensor_parallel ${TP} \
+    --gpu_utilization ${GPU_UTIL} \
+    --seed 42 &
+PID_0=$!
+
+CUDA_VISIBLE_DEVICES=1 python "${PROJECT_ROOT}/scripts/data_processing/self_qa_generate.py" \
+    --input "${INPUT}" \
+    --output "${PROCESSED}/self_qa_raw_part1.jsonl" \
+    --model "${MODEL}" \
+    --mode "${MODE}" \
+    --text_field "text" \
+    --num_questions 3 \
+    --max_samples ${HALF} \
+    --include_reasoning \
+    --temperature 0.7 \
+    --batch_size 32 \
+    --tensor_parallel ${TP} \
+    --gpu_utilization ${GPU_UTIL} \
+    --seed 1337 &
+PID_1=$!
+
+echo "  Instance 0 (GPU 0): PID ${PID_0}"
+echo "  Instance 1 (GPU 1): PID ${PID_1}"
+
+FAIL=0
+wait ${PID_0} || { echo "[FAIL] Instance 0 failed"; FAIL=1; }
+wait ${PID_1} || { echo "[FAIL] Instance 1 failed"; FAIL=1; }
+
+if [ ${FAIL} -ne 0 ]; then
+    echo "[ERROR] Generation failed"
+    exit 1
+fi
+
+# 合并两部分
+cat "${PROCESSED}/self_qa_raw_part0.jsonl" "${PROCESSED}/self_qa_raw_part1.jsonl" > "${OUTPUT}"
+rm -f "${PROCESSED}/self_qa_raw_part0.jsonl" "${PROCESSED}/self_qa_raw_part1.jsonl"
+
+RAW_COUNT=$(wc -l < "${OUTPUT}")
+echo ""
+echo "  Raw QA pairs: ${RAW_COUNT}"
+
+# =============================================
+# Phase 2: 一致性过滤 (14B 幻觉补偿)
+# =============================================
+echo ""
+echo "[Phase 2] Filtering by answer-source consistency..."
+python "${PROJECT_ROOT}/scripts/data_processing/filter_self_qa.py" \
+    --input "${OUTPUT}" \
+    --output "${FILTERED}" \
+    --min_overlap 0.3 \
+    --min_answer_len 30 \
+    --min_question_len 10
+
+CLEAN_COUNT=$(wc -l < "${FILTERED}")
+echo ""
+echo "============================================"
+echo "  Self-QA complete!"
+echo "============================================"
+echo "  Raw generated:  ${RAW_COUNT}"
+echo "  After filter:   ${CLEAN_COUNT}"
+echo "  Output:         ${FILTERED}"
+
+# GRPO reasoning data
+REASONING_0="${PROCESSED}/self_qa_raw_part0_reasoning.jsonl"
+REASONING_1="${PROCESSED}/self_qa_raw_part1_reasoning.jsonl"
+REASONING="${PROCESSED}/self_qa_reasoning.jsonl"
+if [ -f "${REASONING_0}" ] || [ -f "${REASONING_1}" ]; then
+    cat "${REASONING_0}" "${REASONING_1}" > "${REASONING}" 2>/dev/null
+    rm -f "${REASONING_0}" "${REASONING_1}"
+    GRPO_COUNT=$(wc -l < "${REASONING}" 2>/dev/null || echo "0")
+    echo "  GRPO reasoning: ${GRPO_COUNT} pairs → ${REASONING}"
+fi
+
+echo ""
+echo "Next: bash scripts/run_step0_data_prepare.sh"

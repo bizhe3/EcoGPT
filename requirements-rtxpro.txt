@@ -1,0 +1,16 @@
+# EcoGPT - RTX PRO 6000 96G specific dependencies
+# Hardware: 2×RTX PRO 6000 96G (Blackwell, compute capability 12.0)
+# CUDA: 12.8+
+#
+# Install:
+#   conda create -n ecogpt python=3.10 -y && conda activate ecogpt
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu128
+#   pip install flash-attn --no-build-isolation
+#   pip install -r requirements-rtxpro.txt
+#   pip install -r requirements.txt
+#
+# Note: RTX PRO 6000 NVLink 双卡 = 192GB, 72B bf16 放得下 (tp=2)
+
+torch==2.6.0
+vllm>=0.7.0
+# flash-attn>=2.8.0  # 单独安装: pip install flash-attn --no-build-isolation

@@ -138,14 +138,25 @@ def load_corpus(path: str, text_field: str = "text", max_samples: Optional[int] 
 # LLM generation backends
 # ============================================================
 
-def generate_local_vllm(prompts: List[str], model_path: str, max_tokens: int = 1024,
-                        temperature: float = 0.7) -> List[str]:
-    """Generate using local vLLM."""
-    from vllm import LLM, SamplingParams
+def create_vllm_engine(model_path: str, tensor_parallel: int = 4, gpu_utilization: float = 0.90):
+    """Create vLLM engine once, reuse across calls."""
+    from vllm import LLM
+    return LLM(
+        model_path,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        tensor_parallel_size=tensor_parallel,
+        gpu_memory_utilization=gpu_utilization,
+        max_model_len=4096,
+    )
 
-    llm = LLM(model_path, trust_remote_code=True, dtype="bfloat16")
+
+def generate_local_vllm(prompts: List[str], engine, max_tokens: int = 1024,
+                        temperature: float = 0.7) -> List[str]:
+    """Generate using pre-initialized vLLM engine."""
+    from vllm import SamplingParams
     params = SamplingParams(temperature=temperature, max_tokens=max_tokens)
-    outputs = llm.generate(prompts, params)
+    outputs = engine.generate(prompts, params)
     return [o.outputs[0].text for o in outputs]
 
 
@@ -224,7 +235,9 @@ def main():
     ap.add_argument("--include_reasoning", action="store_true",
                     help="Also generate reasoning QA pairs (for GRPO data)")
     ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--batch_size", type=int, default=32, help="Batch size for vLLM generation")
+    ap.add_argument("--batch_size", type=int, default=32, help="Batch size for generation")
+    ap.add_argument("--tensor_parallel", type=int, default=4, help="vLLM tensor parallel GPUs")
+    ap.add_argument("--gpu_utilization", type=float, default=0.90, help="vLLM GPU memory utilization")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -240,10 +253,16 @@ def main():
         logger.error("No paragraphs extracted. Check input file and text_field.")
         return
 
-    # Select generation backend
+    # Initialize engine once
+    vllm_engine = None
+    if args.mode == "local_vllm":
+        logger.info(f"Loading vLLM engine: {args.model} (tp={args.tensor_parallel})")
+        vllm_engine = create_vllm_engine(args.model, args.tensor_parallel, args.gpu_utilization)
+        logger.info("vLLM engine ready")
+
     def generate(prompts):
         if args.mode == "local_vllm":
-            return generate_local_vllm(prompts, args.model, temperature=args.temperature)
+            return generate_local_vllm(prompts, vllm_engine, temperature=args.temperature)
         elif args.mode == "local_hf":
             return generate_local_hf(prompts, args.model, temperature=args.temperature)
         elif args.mode == "api":
@@ -289,7 +308,8 @@ def main():
                     "conversations": [
                         {"from": "human", "value": meta["question"]},
                         {"from": "gpt", "value": answer},
-                    ]
+                    ],
+                    "_source_paragraph": meta["paragraph"],  # 保留源段落, 供 filter_self_qa.py 做一致性检查
                 })
 
         logger.info(f"  Processed {batch_end}/{len(paragraphs)} paragraphs, "
