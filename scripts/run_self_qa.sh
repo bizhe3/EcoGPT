@@ -9,8 +9,7 @@
 # 脚本会在生成后自动运行 filter_self_qa.py 做一致性过滤
 #
 # Prerequisites:
-#   1. FinCorpus fin_exam 已下载并解压
-#   2. gunzip data/sft/raw/fincorpus/fin_exam.jsonl.gz
+#   1. FinCorpus fin_exam 已下载到 data/sft/raw/fincorpus/
 
 set -e
 
@@ -18,11 +17,21 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROCESSED="${PROJECT_ROOT}/data/sft/processed"
 mkdir -p "${PROCESSED}"
 
-INPUT="${PROJECT_ROOT}/data/sft/raw/fincorpus/fin_exam.jsonl"
+# Support both .jsonl.gz and .jsonl
+if [ -f "${PROJECT_ROOT}/data/sft/raw/fincorpus/data/fin_exam.jsonl.gz" ]; then
+    INPUT="${PROJECT_ROOT}/data/sft/raw/fincorpus/data/fin_exam.jsonl.gz"
+elif [ -f "${PROJECT_ROOT}/data/sft/raw/fincorpus/fin_exam.jsonl.gz" ]; then
+    INPUT="${PROJECT_ROOT}/data/sft/raw/fincorpus/fin_exam.jsonl.gz"
+elif [ -f "${PROJECT_ROOT}/data/sft/raw/fincorpus/fin_exam.jsonl" ]; then
+    INPUT="${PROJECT_ROOT}/data/sft/raw/fincorpus/fin_exam.jsonl"
+else
+    echo "[ERROR] fin_exam data not found. Run: huggingface-cli download Duxiaoman-DI/FinCorpus --repo-type dataset --include 'data/fin_exam.jsonl.gz' --local-dir data/sft/raw/fincorpus"
+    exit 1
+fi
 OUTPUT="${PROCESSED}/self_qa_raw.jsonl"
 FILTERED="${PROCESSED}/self_qa.jsonl"
 
-MODEL="Qwen/Qwen2.5-14B-Instruct"
+MODEL="${PROJECT_ROOT}/models/base/Qwen3-14B"
 MODE="local_vllm"
 TP=1
 GPU_UTIL=0.90

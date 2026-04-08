@@ -107,15 +107,22 @@ def extract_paragraphs(text: str, min_len: int = 100, max_len: int = 1500) -> Li
 
 
 def load_corpus(path: str, text_field: str = "text", max_samples: Optional[int] = None) -> List[str]:
-    """Load text corpus from jsonl/json/txt."""
+    """Load text corpus from jsonl/json/txt/jsonl.gz."""
+    import gzip
+
     texts = []
     if path.endswith(".txt"):
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
             texts = extract_paragraphs(content)
     else:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
+        # Support both plain jsonl and gzip-compressed jsonl.gz
+        if path.endswith(".gz"):
+            fh = gzip.open(path, "rt", encoding="utf-8")
+        else:
+            fh = open(path, "r", encoding="utf-8")
+        with fh:
+            for line in fh:
                 line = line.strip()
                 if not line:
                     continue
