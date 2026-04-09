@@ -6,6 +6,9 @@
 
 set -e
 
+# HuggingFace 中国镜像
+export HF_ENDPOINT="https://hf-mirror.com"
+
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RESULTS_DIR="${PROJECT_ROOT}/outputs/eval_results"
 mkdir -p "${RESULTS_DIR}"
