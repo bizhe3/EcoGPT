@@ -35,10 +35,10 @@ python "${PROJECT_ROOT}/scripts/training/grpo_training.py" \
     --lora_rank 8 \
     --lora_alpha 16.0 \
     --lora_dropout 0.05 \
-    --num_generations 4 \
+    --num_generations 8 \
     --temperature 0.9 \
     --use_vllm True \
-    --max_completion_length 512 \
+    --max_completion_length 1024 \
     --beta 0.04 \
     --loss_type grpo \
     --learning_rate 5e-6 \
