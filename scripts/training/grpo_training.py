@@ -270,17 +270,26 @@ def main():
         )
         logger.info(f"Using LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}")
 
-    # Build reward functions with weights
-    reward_funcs = [format_reward, accuracy_reward, length_reward]
-    reward_weights = [args.format_reward_weight, args.accuracy_reward_weight, args.length_reward_weight]
-    logger.info(f"Reward weights: format={reward_weights[0]}, accuracy={reward_weights[1]}, length={reward_weights[2]}")
+    # Build weighted reward function (combine into single function for trl compatibility)
+    fmt_w = args.format_reward_weight
+    acc_w = args.accuracy_reward_weight
+    len_w = args.length_reward_weight
+    logger.info(f"Reward weights: format={fmt_w}, accuracy={acc_w}, length={len_w}")
+
+    def combined_reward(completions: list, ground_truth: list = None, **kwargs) -> list:
+        fmt_scores = format_reward(completions, **kwargs)
+        acc_scores = accuracy_reward(completions, ground_truth=ground_truth, **kwargs)
+        len_scores = length_reward(completions, **kwargs)
+        return [
+            fmt_w * f + acc_w * a + len_w * l
+            for f, a, l in zip(fmt_scores, acc_scores, len_scores)
+        ]
 
     # Initialize trainer
     trainer = GRPOTrainer(
         model=args.model_name_or_path,
         args=grpo_config,
-        reward_funcs=reward_funcs,
-        reward_weights=reward_weights,
+        reward_funcs=combined_reward,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
