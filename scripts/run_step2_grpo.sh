@@ -44,7 +44,7 @@ python "${PROJECT_ROOT}/scripts/training/grpo_training.py" \
     --learning_rate 5e-6 \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 4 \
-    --num_train_epochs 2 \
+    --num_train_epochs 1 \
     --max_grad_norm 0.5 \
     --bf16 True \
     --logging_steps 10 \
