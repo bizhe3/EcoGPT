@@ -111,8 +111,8 @@ echo "[Phase 2] Filtering by answer-source consistency..."
 python "${PROJECT_ROOT}/scripts/data_processing/filter_self_qa.py" \
     --input "${OUTPUT}" \
     --output "${FILTERED}" \
-    --min_overlap 0.3 \
-    --min_answer_len 30 \
+    --min_overlap 0.04 \
+    --min_answer_len 15 \
     --min_question_len 10
 
 CLEAN_COUNT=$(wc -l < "${FILTERED}")
