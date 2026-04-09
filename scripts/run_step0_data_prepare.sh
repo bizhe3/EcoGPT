@@ -17,7 +17,14 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_DIR="${PROJECT_ROOT}/data"
 SCRIPTS="${PROJECT_ROOT}/scripts"
 PROCESSED="${DATA_DIR}/sft/processed"
-TOKENIZER="${PROJECT_ROOT}/models/base/Qwen2.5-7B-Instruct"
+# Auto-detect tokenizer: prefer Qwen3-4B, fallback to others
+if [ -d "${PROJECT_ROOT}/models/base/Qwen3-4B" ]; then
+    TOKENIZER="${PROJECT_ROOT}/models/base/Qwen3-4B"
+elif [ -d "${PROJECT_ROOT}/models/base/Qwen2.5-7B-Instruct" ]; then
+    TOKENIZER="${PROJECT_ROOT}/models/base/Qwen2.5-7B-Instruct"
+else
+    TOKENIZER=""
+fi
 
 mkdir -p "${PROCESSED}"
 
@@ -54,17 +61,44 @@ echo "[Step 0.3] Merging SFT datasets with target ratios..."
 python "${SCRIPTS}/data_processing/merge_sft_data.py" \
     --sources \
         "baai_finance:${PROCESSED}/baai_finance.jsonl:0.40" \
-        "self_qa:${PROCESSED}/self_qa.jsonl:0.25" \
-        "alpaca_zh:${PROCESSED}/finance_alpaca_zh.jsonl:0.15" \
+        "self_qa:${PROCESSED}/self_qa.jsonl:0.20" \
+        "alpaca_zh:${PROCESSED}/finance_alpaca_zh.jsonl:0.20" \
         "sujet_zh:${PROCESSED}/sujet_finance_zh.jsonl:0.10" \
-        "sentiment:${PROCESSED}/fingpt_sentiment.jsonl:0.10" \
-    --total 200000 \
+        "sentiment:${PROCESSED}/fingpt_sentiment_zh.jsonl:0.10" \
+    --total 50000 \
     --output "${PROCESSED}/merged_sft.jsonl" \
     --seed 42
 
-# --- Step 0.4: 去重分析 ---
+# --- Step 0.4: 去重 (精确去重 + 分析报告) ---
 echo ""
-echo "[Step 0.4] Running deduplication analysis..."
+echo "[Step 0.4] Deduplicating..."
+# 精确去重: 按 human 问题内容去重，保留第一条
+python -c "
+import json, hashlib, re, sys
+
+def normalize(text):
+    return re.sub(r'\s+', '', text.lower().strip())
+
+seen = set()
+kept = 0
+total = 0
+with open('${PROCESSED}/merged_sft.jsonl', 'r', encoding='utf-8') as fin, \
+     open('${PROCESSED}/merged_sft_dedup.jsonl', 'w', encoding='utf-8') as fout:
+    for line in fin:
+        total += 1
+        item = json.loads(line.strip())
+        convs = item.get('conversations', [])
+        human = next((m['value'] for m in convs if m.get('from') == 'human'), '')
+        h = hashlib.sha1(normalize(human).encode()).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            fout.write(line)
+            kept += 1
+print(f'Dedup: {total} -> {kept} ({total - kept} duplicates removed)')
+"
+mv "${PROCESSED}/merged_sft_dedup.jsonl" "${PROCESSED}/merged_sft.jsonl"
+
+# 去重分析报告（可选）
 python "${SCRIPTS}/data_processing/check2.py" \
     --data "${PROCESSED}/merged_sft.jsonl" \
     --out_dir "${PROJECT_ROOT}/outputs/dup_report" \
@@ -73,7 +107,7 @@ python "${SCRIPTS}/data_processing/check2.py" \
 # --- Step 0.5: Token 长度过滤 ---
 echo ""
 echo "[Step 0.5] Filtering by token length..."
-if [ -d "${TOKENIZER}" ]; then
+if [ -n "${TOKENIZER}" ] && [ -d "${TOKENIZER}" ]; then
     python "${SCRIPTS}/data_processing/data_filter.py" \
         --input "${PROCESSED}/merged_sft.jsonl" \
         --output "${PROCESSED}/merged_sft_filtered.jsonl" \
