@@ -210,7 +210,7 @@ def main():
 
     logger.info(f"Clean samples: {clean_count}")
     logger.info(f"Contaminated removed: {contaminated_count}")
-    logger.info(f"Contamination rate: {contaminated_count / len(train_samples):.4f}")
+    logger.info(f"Contamination rate: {contaminated_count / max(len(train_samples), 1):.4f}")
     logger.info(f"Clean data saved to: {out_path}")
     logger.info(f"Removed samples saved to: {contaminated_path}")
 

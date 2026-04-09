@@ -41,15 +41,22 @@ def main():
         for line in tqdm(fin, desc="Filtering"):
             ex = json.loads(line)
 
-            instr = (ex.get("instruction") or "").strip()
-            inp = (ex.get("input") or "").strip()
-            out = (ex.get("output") or "").strip()
+            # Support both Alpaca and conversations format
+            if "conversations" in ex:
+                convs = ex["conversations"]
+                human_parts = [m["value"] for m in convs if m.get("from") == "human"]
+                gpt_parts = [m["value"] for m in convs if m.get("from") == "gpt"]
+                prompt_text = " ".join(human_parts).strip()
+                out = " ".join(gpt_parts).strip()
+            else:
+                instr = (ex.get("instruction") or "").strip()
+                inp = (ex.get("input") or "").strip()
+                out = (ex.get("output") or "").strip()
+                prompt_text = instr if not inp else f"{inp}\n{instr}"
 
-            if not instr or not out:
+            if not prompt_text or not out:
                 dropped += 1
                 continue
-
-            prompt_text = instr if not inp else f"{inp}\n{instr}"
 
             prompt_len = tok_len(prompt_text)
             completion_len = tok_len(out)
