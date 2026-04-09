@@ -2,32 +2,32 @@
 # ============================================================
 # EcoGPT - Build GRPO Training Data
 # ============================================================
-# 1. Extract short answers from Self-QA reasoning (LLM-based)
-# 2. Generate new financial calculation QA pairs (LLM-based)
-# 3. Merge, dedup, split into train/val
+# Uses DeepSeek-R1-Distill-Qwen-14B for everything:
+#   1. Extract short answers from Self-QA reasoning
+#   2. Generate new financial calculation QA pairs
+#   3. Self-verify: re-solve each problem, keep only consistent answers
+#   4. Merge, dedup, split into train/val
 #
-# Uses Qwen3-14B for both extraction and generation.
-# Dual GPU: extraction on GPU 0, then generation on GPU 0.
-# Estimated time: ~30 min (1.2K extract + 5K generate)
+# Single model = no GPU switching, faster, more consistent.
+# Estimated time: ~15 min
 
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-GEN_MODEL="${PROJECT_ROOT}/models/base/Qwen3-14B"
-VERIFY_MODEL="${PROJECT_ROOT}/models/base/DeepSeek-R1-Distill-Qwen-14B"
+MODEL="${PROJECT_ROOT}/models/base/DeepSeek-R1-Distill-Qwen-14B"
 INPUT="${PROJECT_ROOT}/data/sft/processed/self_qa_reasoning.jsonl"
 OUTPUT="${PROJECT_ROOT}/data/grpo/train/grpo_all.jsonl"
 NUM_GENERATE=10000
 
 echo "============================================"
-echo "  EcoGPT: Build GRPO Data"
+echo "  EcoGPT: Build GRPO Data (R1 Distill)"
 echo "============================================"
-echo "  Gen Model:    ${GEN_MODEL}"
-echo "  Verify Model: ${VERIFY_MODEL}"
-echo "  Extract:      ${INPUT}"
-echo "  Generate:     ${NUM_GENERATE} new QA pairs"
-echo "  Output:       ${OUTPUT}"
+echo "  Model:    ${MODEL}"
+echo "  Extract:  ${INPUT}"
+echo "  Generate: ${NUM_GENERATE} new QA pairs"
+echo "  Verify:   self-verification (same model re-solves)"
+echo "  Output:   ${OUTPUT}"
 echo ""
 
 mkdir -p "${PROJECT_ROOT}/data/grpo/train" "${PROJECT_ROOT}/data/grpo/val"
@@ -36,8 +36,8 @@ CUDA_VISIBLE_DEVICES=0 python "${PROJECT_ROOT}/scripts/data_processing/build_grp
     --mode both \
     --input "${INPUT}" \
     --output "${OUTPUT}" \
-    --model "${GEN_MODEL}" \
-    --verify_model "${VERIFY_MODEL}" \
+    --model "${MODEL}" \
+    --self_verify \
     --num_samples ${NUM_GENERATE} \
     --batch_size 256 \
     --tensor_parallel 1 \

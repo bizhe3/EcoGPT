@@ -1,34 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EcoGPT - Build GRPO training data.
+EcoGPT - Build GRPO training data using DeepSeek-R1-Distill.
 
-Two modes:
-  1. Extract: Clean existing Self-QA reasoning data (extract short answers via LLM)
-  2. Generate: Generate new financial calculation QA pairs from scratch
+Single model handles all steps:
+  1. Extract: Clean Self-QA reasoning data (extract short answers)
+  2. Generate: Create new financial calculation QA pairs
+  3. Self-verify: Re-solve each problem, keep only consistent answers
 
 Usage:
-    # Extract short answers from Self-QA reasoning
-    python build_grpo_data.py \
-        --mode extract \
-        --input data/sft/processed/self_qa_reasoning.jsonl \
-        --output data/grpo/train/reasoning.jsonl \
-        --model models/base/Qwen3-14B
-
-    # Generate new calculation QA pairs
-    python build_grpo_data.py \
-        --mode generate \
-        --output data/grpo/train/generated.jsonl \
-        --model models/base/Qwen3-14B \
-        --num_samples 5000
-
-    # Both: extract + generate, then merge
     python build_grpo_data.py \
         --mode both \
         --input data/sft/processed/self_qa_reasoning.jsonl \
         --output data/grpo/train/grpo_all.jsonl \
-        --model models/base/Qwen3-14B \
-        --num_samples 5000
+        --model models/base/DeepSeek-R1-Distill-Qwen-14B \
+        --self_verify \
+        --num_samples 10000
 """
 
 import argparse
@@ -43,7 +30,7 @@ from loguru import logger
 
 
 # ============================================================
-# Generation prompts (15 financial calculation topics)
+# Prompts
 # ============================================================
 
 TOPICS = [
@@ -77,6 +64,8 @@ GENERATE_PROMPT = """你是一名金融考试出题专家。请生成一道金�
 
 EXTRACT_PROMPT = "从以下文本中提取最终的数值答案，只输出答案本身（如：72、11580元、-5、13.56万元、15.3%），不要输出任何其他内容。\n\n文本：{text}"
 
+VERIFY_PROMPT = "请计算以下金融题目的答案，只输出最终数值结果（如：72、11580元、-5、13.56万元、15.3%），不要输出推理过程。\n\n题目：{prompt}"
+
 
 # ============================================================
 # vLLM helpers
@@ -109,20 +98,87 @@ def build_chat_prompt(tokenizer, user_content: str) -> str:
         )
 
 
+def strip_thinking(text: str) -> str:
+    """Remove <think>...</think> from output."""
+    if "</think>" in text:
+        return text.split("</think>")[-1].strip()
+    # If thinking started but didn't finish, extract from tail
+    if "<think>" in text and "</think>" not in text:
+        nums = re.findall(r'[-+]?\d+\.?\d*\s*(?:万元|亿元|元|%|万|亿)?', text[-200:])
+        if nums:
+            return nums[-1].strip()
+        return ""
+    return text.strip()
+
+
+def batch_generate(llm, tokenizer, user_messages: List[str],
+                   temperature: float = 0, max_tokens: int = 512) -> List[str]:
+    """Generate responses for a list of user messages."""
+    from vllm import SamplingParams
+
+    prompts = [build_chat_prompt(tokenizer, msg) for msg in user_messages]
+    params = SamplingParams(temperature=temperature, max_tokens=max_tokens,
+                            top_p=0.95 if temperature > 0 else 1.0)
+    outputs = llm.generate(prompts, params)
+    return [strip_thinking(o.outputs[0].text) for o in outputs]
+
+
+# ============================================================
+# Answer matching
+# ============================================================
+
+def extract_number(s: str):
+    """Extract the first number from a string, handling Chinese units."""
+    s = re.sub(r'[*#\s，。]', '', s)
+    match = re.search(r'[-+]?\d*\.?\d+', s)
+    if match:
+        num = float(match.group())
+        after = s[match.end():]
+        if '万亿' in after:
+            num *= 1e12
+        elif '亿' in after:
+            num *= 1e8
+        elif '万' in after:
+            num *= 1e4
+        return num
+    return None
+
+
+def answer_matches(a: str, b: str) -> bool:
+    """Check if two answers match."""
+    if not a or not b:
+        return False
+
+    a = re.sub(r'[*#\s]', '', a.strip())
+    b = re.sub(r'[*#\s]', '', b.strip())
+
+    # Exact match
+    if a == b:
+        return True
+
+    # Numerical match with tolerance
+    na, nb = extract_number(a), extract_number(b)
+    if na is not None and nb is not None:
+        if na == nb == 0:
+            return True
+        if abs(na - nb) < 0.5:
+            return True
+        if abs(na - nb) / max(abs(nb), 0.01) < 0.05:
+            return True
+
+    # Containment match
+    if len(a) > 1 and len(b) > 1:
+        if a in b or b in a:
+            return True
+
+    return False
+
+
 # ============================================================
 # Mode 1: Extract short answers from existing reasoning data
 # ============================================================
 
-def extract_answers(args, llm, tokenizer):
-    from vllm import SamplingParams
-
-    items = []
-    with open(args.input, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                items.append(json.loads(line))
-
+def extract_answers(items: List[dict], llm, tokenizer) -> List[dict]:
     logger.info(f"Loaded {len(items)} reasoning samples")
 
     short_items = []
@@ -130,7 +186,7 @@ def extract_answers(args, llm, tokenizer):
     for item in items:
         gt = item.get("ground_truth", "").strip()
         if not gt:
-            continue  # skip empty ground_truth
+            continue
         if len(gt) < 30:
             short_items.append(item)
         else:
@@ -140,15 +196,10 @@ def extract_answers(args, llm, tokenizer):
     logger.info(f"Long answers (need extraction): {len(long_items)}")
 
     if long_items:
-        prompts = [
-            build_chat_prompt(tokenizer, EXTRACT_PROMPT.format(text=item["ground_truth"]))
-            for item in long_items
-        ]
-        params = SamplingParams(temperature=0, max_tokens=50)
-        outputs = llm.generate(prompts, params)
+        messages = [EXTRACT_PROMPT.format(text=item["ground_truth"]) for item in long_items]
+        answers = batch_generate(llm, tokenizer, messages, temperature=0, max_tokens=50)
 
-        for item, out in zip(long_items, outputs):
-            answer = out.outputs[0].text.strip()
+        for item, answer in zip(long_items, answers):
             if answer and len(answer) < 30:
                 short_items.append({
                     "prompt": item["prompt"],
@@ -163,33 +214,20 @@ def extract_answers(args, llm, tokenizer):
 # Mode 2: Generate new calculation QA pairs
 # ============================================================
 
-def generate_qa(args, llm, tokenizer):
-    from vllm import SamplingParams
-
-    num_samples = args.num_samples
-    batch_size = args.batch_size
+def generate_qa(num_samples: int, batch_size: int, llm, tokenizer) -> List[dict]:
     logger.info(f"Generating {num_samples} financial calculation QA pairs...")
 
-    all_prompts = []
+    all_messages = []
     for _ in range(num_samples):
         topic = random.choice(TOPICS)
-        user_msg = GENERATE_PROMPT.format(topic=topic)
-        all_prompts.append(build_chat_prompt(tokenizer, user_msg))
-
-    params = SamplingParams(temperature=0.8, max_tokens=512, top_p=0.95)
+        all_messages.append(GENERATE_PROMPT.format(topic=topic))
 
     results = []
-    for i in range(0, len(all_prompts), batch_size):
-        batch = all_prompts[i:i + batch_size]
-        outputs = llm.generate(batch, params)
+    for i in range(0, len(all_messages), batch_size):
+        batch = all_messages[i:i + batch_size]
+        responses = batch_generate(llm, tokenizer, batch, temperature=0.8, max_tokens=512)
 
-        for out in outputs:
-            text = out.outputs[0].text.strip()
-            # Strip thinking tags if present
-            if "</think>" in text:
-                text = text.split("</think>")[-1].strip()
-
-            # Parse "题目：... 答案：..."
+        for text in responses:
             q_match = re.search(r'题目[：:]\s*(.*?)(?=\n*答案[：:])', text, re.DOTALL)
             a_match = re.search(r'答案[：:]\s*(.*?)(?:\n|$)', text, re.DOTALL)
 
@@ -202,7 +240,7 @@ def generate_qa(args, llm, tokenizer):
                         "ground_truth": answer,
                     })
 
-        done = min(i + batch_size, len(all_prompts))
+        done = min(i + batch_size, len(all_messages))
         logger.info(f"Generated {done}/{num_samples}, valid: {len(results)}")
 
     logger.info(f"Generated total: {len(results)} valid QA pairs")
@@ -210,122 +248,23 @@ def generate_qa(args, llm, tokenizer):
 
 
 # ============================================================
-# Cross-validation: verify answers with a different model
+# Self-verification: re-solve and compare
 # ============================================================
 
-VERIFY_PROMPT = "请计算以下金融题目的答案，只输出最终数值结果（如：72、11580元、-5、13.56万元、15.3%），不要输出推理过程。\n\n题目：{prompt}"
+def self_verify(items: List[dict], llm, tokenizer) -> List[dict]:
+    """Re-solve each problem with the same model, keep consistent answers."""
+    logger.info(f"Self-verifying {len(items)} items...")
 
-
-def normalize_answer(s: str) -> str:
-    """Normalize answer string for comparison."""
-    # Strip thinking tags
-    if "</think>" in s:
-        s = s.split("</think>")[-1].strip()
-    # Remove common wrappers
-    s = re.sub(r'[*#\s]', '', s)
-    s = s.replace(",", "").replace("，", "").replace("。", "").replace(".", "", s.count(".") - 1 if s.count(".") > 1 else 0)
-    return s.strip()
-
-
-def extract_number(s: str):
-    """Extract the first number from a string, handling Chinese units."""
-    s = normalize_answer(s)
-    # Try to find a number (possibly with sign, decimal)
-    match = re.search(r'[-+]?\d*\.?\d+', s)
-    if match:
-        num = float(match.group())
-        # Handle unit multipliers
-        after = s[match.end():]
-        if '万亿' in after:
-            num *= 1e12
-        elif '亿' in after:
-            num *= 1e8
-        elif '万' in after:
-            num *= 1e4
-        return num
-    return None
-
-
-def answer_matches(a: str, b: str) -> bool:
-    """Check if two answers match (numerical or text)."""
-    a_norm = normalize_answer(a)
-    b_norm = normalize_answer(b)
-
-    if not a_norm or not b_norm:
-        return False
-
-    # Exact normalized match
-    if a_norm == b_norm:
-        return True
-
-    # Numerical match with tolerance
-    na = extract_number(a)
-    nb = extract_number(b)
-    if na is not None and nb is not None:
-        if na == nb == 0:
-            return True
-        if abs(na - nb) < 0.5:
-            return True
-        if abs(na - nb) / max(abs(nb), 0.01) < 0.05:
-            return True
-
-    # Containment match (for text answers)
-    if len(a_norm) > 1 and len(b_norm) > 1:
-        if a_norm in b_norm or b_norm in a_norm:
-            return True
-
-    return False
-
-
-def cross_validate(items: List[dict], verify_model_path: str, tp: int, gpu_util: float):
-    """Use a different model to re-solve each problem, keep only consistent answers."""
-    from vllm import SamplingParams
-
-    logger.info(f"Cross-validating {len(items)} items with {verify_model_path}")
-
-    # Release generation model GPU memory first
-    import gc
-    import torch
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # Load verification model
-    verify_llm, verify_tokenizer = init_vllm(verify_model_path, tp, gpu_util)
-
-    prompts = []
-    for item in items:
-        user_msg = VERIFY_PROMPT.format(prompt=item["prompt"])
-        prompts.append(build_chat_prompt(verify_tokenizer, user_msg))
-
-    # DeepSeek-R1 outputs <think>...</think> before the answer,
-    # need enough tokens for thinking + answer. R1 thinking can be very long.
-    params = SamplingParams(temperature=0, max_tokens=3072)
-    outputs = verify_llm.generate(prompts, params)
+    messages = [VERIFY_PROMPT.format(prompt=item["prompt"]) for item in items]
+    answers = batch_generate(llm, tokenizer, messages, temperature=0, max_tokens=100)
 
     verified = []
     mismatch = 0
-    truncated = 0
     mismatch_examples = []
-    for item, out in zip(items, outputs):
-        verify_answer = out.outputs[0].text.strip()
 
-        # Strip thinking tags (DeepSeek-R1 always outputs <think>...</think>)
-        if "</think>" in verify_answer:
-            verify_answer = verify_answer.split("</think>")[-1].strip()
-        elif "<think>" in verify_answer and "</think>" not in verify_answer:
-            # Thinking was truncated (didn't finish), try to extract number from end
-            truncated += 1
-            # Look for numbers in the last 200 chars
-            tail = verify_answer[-200:]
-            nums = re.findall(r'[-+]?\d+\.?\d*\s*(?:万元|亿元|元|%|万|亿)?', tail)
-            if nums:
-                verify_answer = nums[-1].strip()
-            else:
-                mismatch += 1
-                continue
-
+    for item, verify_answer in zip(items, answers):
         gt = item["ground_truth"]
-        if not gt:
+        if not gt or not verify_answer:
             mismatch += 1
             continue
 
@@ -340,9 +279,8 @@ def cross_validate(items: List[dict], verify_model_path: str, tp: int, gpu_util:
                     "verify": verify_answer[:60],
                 })
 
-    logger.info(f"Cross-validation: {len(items)} -> {len(verified)} "
-                f"({mismatch} mismatches, {truncated} truncated thinking, "
-                f"{len(verified)/max(len(items),1):.1%} kept)")
+    logger.info(f"Self-verification: {len(items)} -> {len(verified)} "
+                f"({mismatch} mismatches, {len(verified)/max(len(items),1):.1%} kept)")
 
     if mismatch_examples:
         logger.info("Mismatch examples:")
@@ -351,11 +289,6 @@ def cross_validate(items: List[dict], verify_model_path: str, tp: int, gpu_util:
             logger.info(f"  gt:     {ex['gt']}")
             logger.info(f"  verify: {ex['verify']}")
             logger.info("")
-
-    # Clean up verify model
-    del verify_llm
-    gc.collect()
-    torch.cuda.empty_cache()
 
     return verified
 
@@ -383,13 +316,14 @@ def dedup(items: List[dict]) -> List[dict]:
 def main():
     ap = argparse.ArgumentParser(description="Build GRPO training data")
     ap.add_argument("--mode", choices=["extract", "generate", "both"], default="both")
-    ap.add_argument("--input", default=None, help="Input Self-QA reasoning jsonl (for extract mode)")
+    ap.add_argument("--input", default=None, help="Input Self-QA reasoning jsonl")
     ap.add_argument("--output", required=True, help="Output GRPO jsonl")
-    ap.add_argument("--model", required=True, help="LLM model path (for generation)")
-    ap.add_argument("--verify_model", default=None,
-                    help="Verification model path (e.g. DeepSeek-R1-Distill). If set, cross-validates answers.")
-    ap.add_argument("--num_samples", type=int, default=10000, help="Number of QA pairs to generate")
-    ap.add_argument("--batch_size", type=int, default=256, help="vLLM batch size for generation")
+    ap.add_argument("--model", required=True, help="Model path (DeepSeek-R1-Distill recommended)")
+    ap.add_argument("--self_verify", action="store_true",
+                    help="Re-solve each problem to verify answer consistency")
+    ap.add_argument("--verify_model", default=None, help="[Deprecated] Use --self_verify instead")
+    ap.add_argument("--num_samples", type=int, default=10000)
+    ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--tensor_parallel", type=int, default=1)
     ap.add_argument("--gpu_utilization", type=float, default=0.9)
     ap.add_argument("--seed", type=int, default=42)
@@ -398,8 +332,8 @@ def main():
     random.seed(args.seed)
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
-    # Phase 1: Generate with primary model
-    logger.info(f"Loading generation model: {args.model}")
+    # Load single model for all steps
+    logger.info(f"Loading model: {args.model}")
     llm, tokenizer = init_vllm(args.model, args.tensor_parallel, args.gpu_utilization)
 
     all_items = []
@@ -407,36 +341,29 @@ def main():
     # Extract
     if args.mode in ("extract", "both"):
         if args.input and os.path.exists(args.input):
-            extracted = extract_answers(args, llm, tokenizer)
+            items = []
+            with open(args.input, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        items.append(json.loads(line))
+            extracted = extract_answers(items, llm, tokenizer)
             all_items.extend(extracted)
         else:
-            logger.warning(f"No input file for extraction: {args.input}")
+            logger.warning(f"No input file: {args.input}")
 
     # Generate
     if args.mode in ("generate", "both"):
-        generated = generate_qa(args, llm, tokenizer)
+        generated = generate_qa(args.num_samples, args.batch_size, llm, tokenizer)
         all_items.extend(generated)
 
-    # Release generation model
-    del llm
-    import gc, torch
-    gc.collect()
-    torch.cuda.empty_cache()
-    logger.info("Released generation model from GPU")
-
-    # Dedup before verification (save compute)
+    # Dedup
     all_items = dedup(all_items)
-
-    # Phase 2: Cross-validate with verification model
     before_verify = len(all_items)
-    if args.verify_model and os.path.exists(args.verify_model):
-        all_items = cross_validate(
-            all_items, args.verify_model,
-            args.tensor_parallel, args.gpu_utilization,
-        )
-    else:
-        if args.verify_model:
-            logger.warning(f"Verify model not found: {args.verify_model}, skipping cross-validation")
+
+    # Self-verify
+    if args.self_verify:
+        all_items = self_verify(all_items, llm, tokenizer)
 
     # Save
     with open(args.output, "w", encoding="utf-8") as f:
@@ -446,9 +373,12 @@ def main():
     print(f"\n{'=' * 50}")
     print(f"  GRPO Data Build Report")
     print(f"{'=' * 50}")
-    print(f"  Before verify: {before_verify}")
-    print(f"  After verify:  {len(all_items)}")
-    print(f"  Pass rate:     {len(all_items)/max(before_verify,1):.1%}")
+    if args.self_verify:
+        print(f"  Before verify: {before_verify}")
+        print(f"  After verify:  {len(all_items)}")
+        print(f"  Pass rate:     {len(all_items)/max(before_verify,1):.1%}")
+    else:
+        print(f"  Total:         {len(all_items)}")
     print(f"  Output:        {args.output}")
     print(f"{'=' * 50}")
 
