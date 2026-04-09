@@ -11,7 +11,7 @@ RESULTS_DIR="${PROJECT_ROOT}/outputs/eval_results"
 mkdir -p "${RESULTS_DIR}"
 
 # ---- Models to evaluate (EDIT THESE) ----
-BASE_MODEL="${PROJECT_ROOT}/models/base/Qwen2.5-7B-Instruct"
+BASE_MODEL="${PROJECT_ROOT}/models/base/Qwen3-4B"
 SFT_MODEL="${PROJECT_ROOT}/models/sft_merged"
 GRPO_MODEL="${PROJECT_ROOT}/models/grpo_merged"
 
