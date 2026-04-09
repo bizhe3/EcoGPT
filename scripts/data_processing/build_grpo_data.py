@@ -208,6 +208,91 @@ def generate_qa(args, llm, tokenizer):
 
 
 # ============================================================
+# Cross-validation: verify answers with a different model
+# ============================================================
+
+VERIFY_PROMPT = "请计算以下金融题目的答案，只输出最终数值结果（如：72、11580元、-5、13.56万元、15.3%），不要输出推理过程或其他内容。\n\n题目：{prompt}"
+
+
+def answer_matches(a: str, b: str) -> bool:
+    """Check if two answers match (numerical or text)."""
+    a = a.strip().replace(",", "").replace(" ", "")
+    b = b.strip().replace(",", "").replace(" ", "")
+
+    # Exact match
+    if a == b:
+        return True
+
+    # Try numerical match with tolerance
+    def extract_num(s):
+        s = s.replace("万元", "").replace("亿元", "").replace("元", "")
+        s = s.replace("%", "").replace("$", "").replace("¥", "")
+        s = s.replace("万", "").replace("亿", "")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    na, nb = extract_num(a), extract_num(b)
+    if na is not None and nb is not None:
+        if abs(na - nb) < 0.5 or (abs(na - nb) / max(abs(nb), 0.01)) < 0.05:
+            return True
+
+    # Containment match
+    if a in b or b in a:
+        return True
+
+    return False
+
+
+def cross_validate(items: List[dict], verify_model_path: str, tp: int, gpu_util: float):
+    """Use a different model to re-solve each problem, keep only consistent answers."""
+    from vllm import SamplingParams
+
+    logger.info(f"Cross-validating {len(items)} items with {verify_model_path}")
+
+    # Release generation model GPU memory first
+    import gc
+    import torch
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Load verification model
+    verify_llm, verify_tokenizer = init_vllm(verify_model_path, tp, gpu_util)
+
+    prompts = []
+    for item in items:
+        user_msg = VERIFY_PROMPT.format(prompt=item["prompt"])
+        prompts.append(build_chat_prompt(verify_tokenizer, user_msg))
+
+    params = SamplingParams(temperature=0, max_tokens=50)
+    outputs = verify_llm.generate(prompts, params)
+
+    verified = []
+    mismatch = 0
+    for item, out in zip(items, outputs):
+        verify_answer = out.outputs[0].text.strip()
+        # Strip thinking tags
+        if "</think>" in verify_answer:
+            verify_answer = verify_answer.split("</think>")[-1].strip()
+
+        if answer_matches(item["ground_truth"], verify_answer):
+            verified.append(item)
+        else:
+            mismatch += 1
+
+    logger.info(f"Cross-validation: {len(items)} -> {len(verified)} "
+                f"({mismatch} mismatches removed, {len(verified)/len(items):.1%} kept)")
+
+    # Clean up verify model
+    del verify_llm
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return verified
+
+
+# ============================================================
 # Dedup
 # ============================================================
 
@@ -232,8 +317,10 @@ def main():
     ap.add_argument("--mode", choices=["extract", "generate", "both"], default="both")
     ap.add_argument("--input", default=None, help="Input Self-QA reasoning jsonl (for extract mode)")
     ap.add_argument("--output", required=True, help="Output GRPO jsonl")
-    ap.add_argument("--model", required=True, help="LLM model path")
-    ap.add_argument("--num_samples", type=int, default=5000, help="Number of QA pairs to generate")
+    ap.add_argument("--model", required=True, help="LLM model path (for generation)")
+    ap.add_argument("--verify_model", default=None,
+                    help="Verification model path (e.g. DeepSeek-R1-Distill). If set, cross-validates answers.")
+    ap.add_argument("--num_samples", type=int, default=10000, help="Number of QA pairs to generate")
     ap.add_argument("--batch_size", type=int, default=256, help="vLLM batch size for generation")
     ap.add_argument("--tensor_parallel", type=int, default=1)
     ap.add_argument("--gpu_utilization", type=float, default=0.9)
@@ -243,7 +330,8 @@ def main():
     random.seed(args.seed)
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
 
-    logger.info(f"Loading model: {args.model}")
+    # Phase 1: Generate with primary model
+    logger.info(f"Loading generation model: {args.model}")
     llm, tokenizer = init_vllm(args.model, args.tensor_parallel, args.gpu_utilization)
 
     all_items = []
@@ -261,9 +349,28 @@ def main():
         generated = generate_qa(args, llm, tokenizer)
         all_items.extend(generated)
 
-    # Dedup and save
+    # Release generation model
+    del llm
+    import gc, torch
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info("Released generation model from GPU")
+
+    # Dedup before verification (save compute)
     all_items = dedup(all_items)
 
+    # Phase 2: Cross-validate with verification model
+    before_verify = len(all_items)
+    if args.verify_model and os.path.exists(args.verify_model):
+        all_items = cross_validate(
+            all_items, args.verify_model,
+            args.tensor_parallel, args.gpu_utilization,
+        )
+    else:
+        if args.verify_model:
+            logger.warning(f"Verify model not found: {args.verify_model}, skipping cross-validation")
+
+    # Save
     with open(args.output, "w", encoding="utf-8") as f:
         for item in all_items:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -271,8 +378,10 @@ def main():
     print(f"\n{'=' * 50}")
     print(f"  GRPO Data Build Report")
     print(f"{'=' * 50}")
-    print(f"  Total:  {len(all_items)}")
-    print(f"  Output: {args.output}")
+    print(f"  Before verify: {before_verify}")
+    print(f"  After verify:  {len(all_items)}")
+    print(f"  Pass rate:     {len(all_items)/max(before_verify,1):.1%}")
+    print(f"  Output:        {args.output}")
     print(f"{'=' * 50}")
 
 

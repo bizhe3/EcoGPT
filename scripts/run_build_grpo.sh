@@ -14,18 +14,20 @@ set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-MODEL="${PROJECT_ROOT}/models/base/Qwen3-14B"
+GEN_MODEL="${PROJECT_ROOT}/models/base/Qwen3-14B"
+VERIFY_MODEL="${PROJECT_ROOT}/models/base/DeepSeek-R1-Distill-Qwen-14B"
 INPUT="${PROJECT_ROOT}/data/sft/processed/self_qa_reasoning.jsonl"
 OUTPUT="${PROJECT_ROOT}/data/grpo/train/grpo_all.jsonl"
-NUM_GENERATE=5000
+NUM_GENERATE=10000
 
 echo "============================================"
 echo "  EcoGPT: Build GRPO Data"
 echo "============================================"
-echo "  Model:    ${MODEL}"
-echo "  Extract:  ${INPUT}"
-echo "  Generate: ${NUM_GENERATE} new QA pairs"
-echo "  Output:   ${OUTPUT}"
+echo "  Gen Model:    ${GEN_MODEL}"
+echo "  Verify Model: ${VERIFY_MODEL}"
+echo "  Extract:      ${INPUT}"
+echo "  Generate:     ${NUM_GENERATE} new QA pairs"
+echo "  Output:       ${OUTPUT}"
 echo ""
 
 mkdir -p "${PROJECT_ROOT}/data/grpo/train" "${PROJECT_ROOT}/data/grpo/val"
@@ -34,7 +36,8 @@ CUDA_VISIBLE_DEVICES=0 python "${PROJECT_ROOT}/scripts/data_processing/build_grp
     --mode both \
     --input "${INPUT}" \
     --output "${OUTPUT}" \
-    --model "${MODEL}" \
+    --model "${GEN_MODEL}" \
+    --verify_model "${VERIFY_MODEL}" \
     --num_samples ${NUM_GENERATE} \
     --batch_size 256 \
     --tensor_parallel 1 \
