@@ -60,11 +60,11 @@ echo ""
 echo "[Step 0.3] Merging SFT datasets with target ratios..."
 python "${SCRIPTS}/data_processing/merge_sft_data.py" \
     --sources \
-        "baai_finance:${PROCESSED}/baai_finance.jsonl:0.40" \
+        "baai_finance:${PROCESSED}/baai_finance.jsonl:0.35" \
         "self_qa:${PROCESSED}/self_qa.jsonl:0.20" \
         "alpaca_zh:${PROCESSED}/finance_alpaca_zh.jsonl:0.20" \
-        "sujet_zh:${PROCESSED}/sujet_finance_zh.jsonl:0.10" \
-        "sentiment:${PROCESSED}/fingpt_sentiment_zh.jsonl:0.10" \
+        "sujet_zh:${PROCESSED}/sujet_finance_zh.jsonl:0.05" \
+        "general_zh:${PROCESSED}/general_zh.jsonl:0.20" \
     --total 50000 \
     --output "${PROCESSED}/merged_sft.jsonl" \
     --seed 42
