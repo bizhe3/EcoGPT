@@ -41,6 +41,7 @@ python "${SCRIPTS}/data_processing/filter_baai.py" \
     --output "${PROCESSED}/baai_finance.jsonl" \
     --min_deita_score 5.0 \
     --min_rw_score 0.0 \
+    --lang zh \
     --min_turns 2 \
     --min_answer_len 20
 
@@ -55,6 +56,52 @@ else
     echo "  [SKIP] No Alpaca data found, skipping conversion"
 fi
 
+# --- Step 0.2.5: 清洗各数据源 ---
+echo ""
+echo "[Step 0.2.5] Cleaning data sources..."
+python -c "
+import json, re, sys
+
+THINKING_STARTS = ['嗯', '好的', '用户', '首先', '接下来', '让我', '我现在', '我需要']
+
+def is_dirty(item):
+    convs = item.get('conversations', [])
+    if len(convs) < 2:
+        return True
+    human = next((m['value'] for m in convs if m.get('from') == 'human'), '')
+    gpt = next((m['value'] for m in convs if m.get('from') == 'gpt'), '')
+    # Filter: human starts with thinking keywords
+    for kw in THINKING_STARTS:
+        if human.strip().startswith(kw + '，') or human.strip().startswith(kw + ','):
+            return True
+    # Filter: gpt has heavy repetition (same 50-char block appears 3+ times)
+    if len(gpt) > 200:
+        block = gpt[:50]
+        if gpt.count(block) >= 3:
+            return True
+    # Filter: gpt too short (< 2 chars)
+    if len(gpt.strip()) < 2:
+        return True
+    # Filter: empty human
+    if len(human.strip()) < 5:
+        return True
+    return False
+
+for src in ['self_qa']:
+    path = '${PROCESSED}/' + src + '.jsonl'
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            items = [json.loads(l) for l in f if l.strip()]
+        before = len(items)
+        items = [i for i in items if not is_dirty(i)]
+        with open(path, 'w', encoding='utf-8') as f:
+            for i in items:
+                f.write(json.dumps(i, ensure_ascii=False) + '\n')
+        print(f'  {src}: {before} -> {len(items)} ({before - len(items)} dirty removed)')
+    except FileNotFoundError:
+        print(f'  {src}: not found, skipping')
+"
+
 # --- Step 0.3: 多源合并 (按配比采样) ---
 echo ""
 echo "[Step 0.3] Merging SFT datasets with target ratios..."
@@ -68,6 +115,59 @@ python "${SCRIPTS}/data_processing/merge_sft_data.py" \
     --total 50000 \
     --output "${PROCESSED}/merged_sft.jsonl" \
     --seed 42
+
+# --- Step 0.3.5: 全局质量过滤 ---
+echo ""
+echo "[Step 0.3.5] Global quality filtering..."
+python -c "
+import json, re
+
+THINKING_STARTS = ['嗯', '好的，我', '用户让我', '首先，我需要', '接下来', '让我', '我现在需要', '我需要']
+
+kept = 0
+dropped = 0
+with open('${PROCESSED}/merged_sft.jsonl', 'r', encoding='utf-8') as fin, \
+     open('${PROCESSED}/merged_sft_clean.jsonl', 'w', encoding='utf-8') as fout:
+    for line in fin:
+        item = json.loads(line.strip())
+        convs = item.get('conversations', [])
+        if len(convs) < 2:
+            dropped += 1
+            continue
+        human = next((m['value'] for m in convs if m.get('from') == 'human'), '')
+        gpt = next((m['value'] for m in convs if m.get('from') == 'gpt'), '')
+
+        skip = False
+        # 1. Human is thinking content
+        for kw in THINKING_STARTS:
+            if human.strip().startswith(kw):
+                if '，' in human[:len(kw)+5] or '。' in human[:len(kw)+5]:
+                    skip = True
+                    break
+        # 2. GPT has heavy repetition
+        if not skip and len(gpt) > 300:
+            block = gpt[50:100]
+            if block and gpt.count(block) >= 3:
+                skip = True
+        # 3. GPT too short
+        if not skip and len(gpt.strip()) < 2:
+            skip = True
+        # 4. Human too short
+        if not skip and len(human.strip()) < 5:
+            skip = True
+        # 5. Contains thinking tags in GPT
+        if not skip and '<think>' in gpt:
+            skip = True
+
+        if skip:
+            dropped += 1
+        else:
+            fout.write(json.dumps(item, ensure_ascii=False) + '\n')
+            kept += 1
+
+print(f'  Global filter: kept={kept}, dropped={dropped}')
+"
+mv "${PROCESSED}/merged_sft_clean.jsonl" "${PROCESSED}/merged_sft.jsonl"
 
 # --- Step 0.4: 去重 (精确去重 + 分析报告) ---
 echo ""
