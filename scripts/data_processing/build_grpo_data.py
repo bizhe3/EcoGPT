@@ -129,6 +129,8 @@ def extract_answers(args, llm, tokenizer):
     long_items = []
     for item in items:
         gt = item.get("ground_truth", "").strip()
+        if not gt:
+            continue  # skip empty ground_truth
         if len(gt) < 30:
             short_items.append(item)
         else:
@@ -214,33 +216,63 @@ def generate_qa(args, llm, tokenizer):
 VERIFY_PROMPT = "请计算以下金融题目的答案，只输出最终数值结果（如：72、11580元、-5、13.56万元、15.3%），不要输出推理过程或其他内容。\n\n题目：{prompt}"
 
 
+def normalize_answer(s: str) -> str:
+    """Normalize answer string for comparison."""
+    # Strip thinking tags
+    if "</think>" in s:
+        s = s.split("</think>")[-1].strip()
+    # Remove common wrappers
+    s = re.sub(r'[*#\s]', '', s)
+    s = s.replace(",", "").replace("，", "").replace("。", "").replace(".", "", s.count(".") - 1 if s.count(".") > 1 else 0)
+    return s.strip()
+
+
+def extract_number(s: str):
+    """Extract the first number from a string, handling Chinese units."""
+    s = normalize_answer(s)
+    # Try to find a number (possibly with sign, decimal)
+    match = re.search(r'[-+]?\d*\.?\d+', s)
+    if match:
+        num = float(match.group())
+        # Handle unit multipliers
+        after = s[match.end():]
+        if '万亿' in after:
+            num *= 1e12
+        elif '亿' in after:
+            num *= 1e8
+        elif '万' in after:
+            num *= 1e4
+        return num
+    return None
+
+
 def answer_matches(a: str, b: str) -> bool:
     """Check if two answers match (numerical or text)."""
-    a = a.strip().replace(",", "").replace(" ", "")
-    b = b.strip().replace(",", "").replace(" ", "")
+    a_norm = normalize_answer(a)
+    b_norm = normalize_answer(b)
 
-    # Exact match
-    if a == b:
+    if not a_norm or not b_norm:
+        return False
+
+    # Exact normalized match
+    if a_norm == b_norm:
         return True
 
-    # Try numerical match with tolerance
-    def extract_num(s):
-        s = s.replace("万元", "").replace("亿元", "").replace("元", "")
-        s = s.replace("%", "").replace("$", "").replace("¥", "")
-        s = s.replace("万", "").replace("亿", "")
-        try:
-            return float(s)
-        except ValueError:
-            return None
-
-    na, nb = extract_num(a), extract_num(b)
+    # Numerical match with tolerance
+    na = extract_number(a)
+    nb = extract_number(b)
     if na is not None and nb is not None:
-        if abs(na - nb) < 0.5 or (abs(na - nb) / max(abs(nb), 0.01)) < 0.05:
+        if na == nb == 0:
+            return True
+        if abs(na - nb) < 0.5:
+            return True
+        if abs(na - nb) / max(abs(nb), 0.01) < 0.05:
             return True
 
-    # Containment match
-    if a in b or b in a:
-        return True
+    # Containment match (for text answers)
+    if len(a_norm) > 1 and len(b_norm) > 1:
+        if a_norm in b_norm or b_norm in a_norm:
+            return True
 
     return False
 
@@ -265,24 +297,46 @@ def cross_validate(items: List[dict], verify_model_path: str, tp: int, gpu_util:
         user_msg = VERIFY_PROMPT.format(prompt=item["prompt"])
         prompts.append(build_chat_prompt(verify_tokenizer, user_msg))
 
-    params = SamplingParams(temperature=0, max_tokens=50)
+    # DeepSeek-R1 outputs <think>...</think> before the answer,
+    # so we need enough tokens for both thinking and answer
+    params = SamplingParams(temperature=0, max_tokens=1024)
     outputs = verify_llm.generate(prompts, params)
 
     verified = []
     mismatch = 0
+    mismatch_examples = []
     for item, out in zip(items, outputs):
         verify_answer = out.outputs[0].text.strip()
-        # Strip thinking tags
+        # Strip thinking tags (DeepSeek-R1 always outputs <think>...</think>)
         if "</think>" in verify_answer:
             verify_answer = verify_answer.split("</think>")[-1].strip()
 
-        if answer_matches(item["ground_truth"], verify_answer):
+        gt = item["ground_truth"]
+        if not gt:
+            mismatch += 1
+            continue
+
+        if answer_matches(gt, verify_answer):
             verified.append(item)
         else:
             mismatch += 1
+            if len(mismatch_examples) < 5:
+                mismatch_examples.append({
+                    "prompt": item["prompt"][:60],
+                    "gt": gt,
+                    "verify": verify_answer[:60],
+                })
 
     logger.info(f"Cross-validation: {len(items)} -> {len(verified)} "
-                f"({mismatch} mismatches removed, {len(verified)/len(items):.1%} kept)")
+                f"({mismatch} mismatches removed, {len(verified)/max(len(items),1):.1%} kept)")
+
+    if mismatch_examples:
+        logger.info("Mismatch examples:")
+        for ex in mismatch_examples:
+            logger.info(f"  prompt: {ex['prompt']}...")
+            logger.info(f"  gt:     {ex['gt']}")
+            logger.info(f"  verify: {ex['verify']}")
+            logger.info("")
 
     # Clean up verify model
     del verify_llm
