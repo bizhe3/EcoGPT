@@ -101,8 +101,9 @@ class GRPOScriptArguments:
 # ============================================================
 # Reward Functions (Financial Domain)
 # ============================================================
-# No dependency on <think>/<answer> tags.
-# Works with any model output format.
+# Designed for Qwen3 native thinking mode.
+# Qwen3 outputs: <think>reasoning</think>final answer
+# We extract the answer from the part AFTER </think>.
 
 def _extract_number(s: str):
     """Extract first number from string, handling Chinese units."""
@@ -127,12 +128,49 @@ def _normalize_text(s: str) -> str:
     return s.lower().strip()
 
 
+def _extract_answer_part(completion: str) -> str:
+    """Extract the answer part from Qwen3 thinking output.
+    Qwen3 format: <think>...</think>answer text
+    If no thinking tags, return the entire completion.
+    """
+    if '</think>' in completion:
+        return completion.split('</think>')[-1].strip()
+    return completion.strip()
+
+
+def format_reward(completions: List[str], **kwargs) -> List[float]:
+    """
+    Reward proper thinking structure.
+    Qwen3 native format: <think>...</think> followed by answer.
+    - Has <think>...</think> + non-empty answer after → 1.0
+    - Has <think> but no </think> (truncated thinking) → 0.0
+    - No thinking at all but has content → 0.2 (partial credit)
+    - Empty → 0.0
+    Weight: 1.0
+    """
+    rewards = []
+    for c in completions:
+        c = c.strip()
+        if not c:
+            rewards.append(0.0)
+        elif '<think>' in c and '</think>' in c:
+            answer_part = _extract_answer_part(c)
+            if len(answer_part) > 0:
+                rewards.append(1.0)  # Full thinking + answer
+            else:
+                rewards.append(0.3)  # Thinking but empty answer
+        elif '<think>' in c and '</think>' not in c:
+            rewards.append(0.0)  # Truncated thinking, no answer
+        else:
+            rewards.append(0.2)  # No thinking, direct answer (partial credit)
+    return rewards
+
+
 def accuracy_reward(completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
     """
-    Check if the completion contains the correct answer.
-    Searches the entire completion for the ground truth value.
-    - Numerical: extract all numbers, check if any match gt (5% tolerance)
-    - Text: check if gt text appears in completion
+    Check if the answer part (after </think>) matches ground truth.
+    Only searches the answer portion, NOT the thinking process,
+    to avoid false positives from intermediate calculation numbers.
     Weight: 2.0
     """
     rewards = []
@@ -142,16 +180,20 @@ def accuracy_reward(completions: List[str], ground_truth: List[str], **kwargs) -
             rewards.append(0.0)
             continue
 
+        # Extract only the answer part (after </think>)
+        answer_part = _extract_answer_part(c)
+        if not answer_part:
+            rewards.append(0.0)
+            continue
+
         # Try numerical matching
         gt_num = _extract_number(gt_str)
         if gt_num is not None:
-            # Extract all numbers from completion
-            nums = re.findall(r'[-+]?\d*\.?\d+', c.replace(',', '').replace('，', ''))
+            nums = re.findall(r'[-+]?\d*\.?\d+', answer_part.replace(',', '').replace('，', ''))
             matched = False
             for n_str in nums:
                 try:
                     n_val = float(n_str)
-                    # Check with tolerance
                     if gt_num == 0 and n_val == 0:
                         matched = True
                         break
@@ -166,11 +208,11 @@ def accuracy_reward(completions: List[str], ground_truth: List[str], **kwargs) -
             rewards.append(1.0 if matched else 0.0)
             continue
 
-        # Text matching: check if normalized gt appears in completion
+        # Text matching on answer part only
         norm_gt = _normalize_text(gt_str)
-        norm_c = _normalize_text(c)
+        norm_a = _normalize_text(answer_part)
 
-        if norm_gt in norm_c:
+        if norm_gt in norm_a:
             rewards.append(1.0)
         else:
             rewards.append(0.0)
@@ -179,21 +221,31 @@ def accuracy_reward(completions: List[str], ground_truth: List[str], **kwargs) -
 
 def length_reward(completions: List[str], **kwargs) -> List[float]:
     """
-    Reward appropriate response length.
-    Too short = probably no reasoning. Too long = verbose/repetitive.
+    Reward appropriate thinking length.
+    Encourages the model to think before answering.
     Weight: 0.5
     """
     rewards = []
     for c in completions:
-        length = len(c)
-        if length < 20:
-            rewards.append(0.0)
-        elif length < 50:
-            rewards.append(0.3)
-        elif length > 2000:
-            rewards.append(0.3)
+        # Extract thinking part if present
+        think_match = re.search(r'<think>(.*?)</think>', c, re.DOTALL)
+        if think_match:
+            think_len = len(think_match.group(1))
+            if think_len < 20:
+                rewards.append(0.2)   # Too short thinking
+            elif think_len > 2000:
+                rewards.append(0.3)   # Too verbose
+            else:
+                rewards.append(1.0)   # Good thinking length
         else:
-            rewards.append(1.0)
+            # No thinking block
+            total_len = len(c.strip())
+            if total_len < 20:
+                rewards.append(0.0)
+            elif total_len > 50:
+                rewards.append(0.3)   # Has content but no thinking
+            else:
+                rewards.append(0.1)
     return rewards
 
 
@@ -243,12 +295,13 @@ def main():
     SYSTEM_PROMPT = "你是一个专业的金融分析助手。请仔细分析问题并给出准确的答案。"
 
     def format_prompt(example):
-        """Wrap raw prompt into chat format with system instruction."""
+        """Wrap raw prompt into chat format. Thinking mode enabled by default."""
         prompt = example["prompt"]
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
+        # Do NOT set enable_thinking=False — let Qwen3 think natively
         formatted = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
@@ -298,16 +351,18 @@ def main():
         logger.info(f"Using LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}")
 
     # Build weighted reward function
+    fmt_w = args.format_reward_weight
     acc_w = args.accuracy_reward_weight
     len_w = args.length_reward_weight
-    logger.info(f"Reward weights: accuracy={acc_w}, length={len_w}")
+    logger.info(f"Reward weights: format={fmt_w}, accuracy={acc_w}, length={len_w}")
 
     def combined_reward(completions: list, ground_truth: list = None, **kwargs) -> list:
+        fmt_scores = format_reward(completions, **kwargs)
         acc_scores = accuracy_reward(completions, ground_truth=ground_truth, **kwargs)
         len_scores = length_reward(completions, **kwargs)
         return [
-            acc_w * a + len_w * l
-            for a, l in zip(acc_scores, len_scores)
+            fmt_w * f + acc_w * a + len_w * l
+            for f, a, l in zip(fmt_scores, acc_scores, len_scores)
         ]
 
     # Initialize trainer
