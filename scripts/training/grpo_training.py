@@ -101,64 +101,77 @@ class GRPOScriptArguments:
 # ============================================================
 # Reward Functions (Financial Domain)
 # ============================================================
+# No dependency on <think>/<answer> tags.
+# Works with any model output format.
 
-def format_reward(completions: List[str], **kwargs) -> List[float]:
-    """
-    Enforce <think>...</think><answer>...</answer> structure.
-    Weight: 1.0 (configurable via args)
-    """
-    pattern = r"<think>[\s\S]+?</think>\s*<answer>[\s\S]+?</answer>"
-    rewards = []
-    for c in completions:
-        if re.search(pattern, c):
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
-    return rewards
+def _extract_number(s: str):
+    """Extract first number from string, handling Chinese units."""
+    s = re.sub(r'[,，\s]', '', s)
+    match = re.search(r'[-+]?\d*\.?\d+', s)
+    if match:
+        num = float(match.group())
+        after = s[match.end():]
+        if '万亿' in after:
+            num *= 1e12
+        elif '亿' in after:
+            num *= 1e8
+        elif '万' in after:
+            num *= 1e4
+        return num
+    return None
+
+
+def _normalize_text(s: str) -> str:
+    """Normalize text for comparison."""
+    s = re.sub(r'[，。、；：""''！？\s,.:;!?\-\'\"()（）]', '', s)
+    return s.lower().strip()
 
 
 def accuracy_reward(completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
     """
-    Extract content from <answer> tags and compare with ground truth.
-    - Numerical: absolute tolerance (0.5) OR relative tolerance (2%), whichever is more lenient
-    - Text: normalized exact match, with partial credit for containment
-    Weight: 2.0 (configurable via args)
+    Check if the completion contains the correct answer.
+    Searches the entire completion for the ground truth value.
+    - Numerical: extract all numbers, check if any match gt (5% tolerance)
+    - Text: check if gt text appears in completion
+    Weight: 2.0
     """
     rewards = []
     for c, gt in zip(completions, ground_truth):
-        match = re.search(r"<answer>(.*?)</answer>", c, re.DOTALL)
-        if not match:
+        gt_str = str(gt).strip()
+        if not gt_str:
             rewards.append(0.0)
             continue
-        answer = match.group(1).strip()
-        gt_str = str(gt).strip()
 
         # Try numerical matching
-        try:
-            a_val = float(answer.replace(",", "").replace("%", "").replace("亿", "").replace("万", ""))
-            g_val = float(gt_str.replace(",", "").replace("%", "").replace("亿", "").replace("万", ""))
-            abs_ok = abs(a_val - g_val) < 0.5
-            rel_ok = (abs(a_val - g_val) / max(abs(g_val), 1.0)) < 0.02
-            if abs_ok or rel_ok:
-                rewards.append(1.0)
-            else:
-                rewards.append(0.0)
+        gt_num = _extract_number(gt_str)
+        if gt_num is not None:
+            # Extract all numbers from completion
+            nums = re.findall(r'[-+]?\d*\.?\d+', c.replace(',', '').replace('，', ''))
+            matched = False
+            for n_str in nums:
+                try:
+                    n_val = float(n_str)
+                    # Check with tolerance
+                    if gt_num == 0 and n_val == 0:
+                        matched = True
+                        break
+                    if abs(n_val - gt_num) < 0.5:
+                        matched = True
+                        break
+                    if gt_num != 0 and abs(n_val - gt_num) / abs(gt_num) < 0.05:
+                        matched = True
+                        break
+                except ValueError:
+                    continue
+            rewards.append(1.0 if matched else 0.0)
             continue
-        except ValueError:
-            pass
 
-        # Text matching: normalize then compare
-        def normalize(s):
-            s = re.sub(r'[，。、；：""''！？\s,.:;!?\-\'\"()]', '', s)
-            return s.lower().strip()
+        # Text matching: check if normalized gt appears in completion
+        norm_gt = _normalize_text(gt_str)
+        norm_c = _normalize_text(c)
 
-        norm_a = normalize(answer)
-        norm_g = normalize(gt_str)
-
-        if norm_a == norm_g:
+        if norm_gt in norm_c:
             rewards.append(1.0)
-        elif norm_g in norm_a or norm_a in norm_g:
-            rewards.append(0.5)
         else:
             rewards.append(0.0)
     return rewards
@@ -166,19 +179,17 @@ def accuracy_reward(completions: List[str], ground_truth: List[str], **kwargs) -
 
 def length_reward(completions: List[str], **kwargs) -> List[float]:
     """
-    Penalize too-short (<50 chars) or too-long (>2000 chars) reasoning.
-    Encourages natural reasoning emergence via accuracy signal.
-    Weight: 0.5 (configurable via args)
+    Reward appropriate response length.
+    Too short = probably no reasoning. Too long = verbose/repetitive.
+    Weight: 0.5
     """
     rewards = []
     for c in completions:
-        think = re.search(r"<think>(.*?)</think>", c, re.DOTALL)
-        if not think:
+        length = len(c)
+        if length < 20:
             rewards.append(0.0)
-            continue
-        length = len(think.group(1))
-        if length < 50:
-            rewards.append(0.2)
+        elif length < 50:
+            rewards.append(0.3)
         elif length > 2000:
             rewards.append(0.3)
         else:
@@ -229,11 +240,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # Load dataset and format prompts with system instruction
-    SYSTEM_PROMPT = (
-        "你是一个专业的金融分析助手。请先在<think>标签中进行分析推理，"
-        "然后在<answer>标签中给出最终答案。\n"
-        "格式：<think>你的推理过程</think><answer>最终答案</answer>"
-    )
+    SYSTEM_PROMPT = "你是一个专业的金融分析助手。请仔细分析问题并给出准确的答案。"
 
     def format_prompt(example):
         """Wrap raw prompt into chat format with system instruction."""
@@ -290,19 +297,17 @@ def main():
         )
         logger.info(f"Using LoRA: rank={args.lora_rank}, alpha={args.lora_alpha}")
 
-    # Build weighted reward function (combine into single function for trl compatibility)
-    fmt_w = args.format_reward_weight
+    # Build weighted reward function
     acc_w = args.accuracy_reward_weight
     len_w = args.length_reward_weight
-    logger.info(f"Reward weights: format={fmt_w}, accuracy={acc_w}, length={len_w}")
+    logger.info(f"Reward weights: accuracy={acc_w}, length={len_w}")
 
     def combined_reward(completions: list, ground_truth: list = None, **kwargs) -> list:
-        fmt_scores = format_reward(completions, **kwargs)
         acc_scores = accuracy_reward(completions, ground_truth=ground_truth, **kwargs)
         len_scores = length_reward(completions, **kwargs)
         return [
-            fmt_w * f + acc_w * a + len_w * l
-            for f, a, l in zip(fmt_scores, acc_scores, len_scores)
+            acc_w * a + len_w * l
+            for a, l in zip(acc_scores, len_scores)
         ]
 
     # Initialize trainer
