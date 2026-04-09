@@ -56,62 +56,16 @@ else
     echo "  [SKIP] No Alpaca data found, skipping conversion"
 fi
 
-# --- Step 0.2.5: 清洗各数据源 ---
-echo ""
-echo "[Step 0.2.5] Cleaning data sources..."
-python -c "
-import json, re, sys
-
-THINKING_STARTS = ['嗯', '好的', '用户', '首先', '接下来', '让我', '我现在', '我需要']
-
-def is_dirty(item):
-    convs = item.get('conversations', [])
-    if len(convs) < 2:
-        return True
-    human = next((m['value'] for m in convs if m.get('from') == 'human'), '')
-    gpt = next((m['value'] for m in convs if m.get('from') == 'gpt'), '')
-    # Filter: human starts with thinking keywords
-    for kw in THINKING_STARTS:
-        if human.strip().startswith(kw + '，') or human.strip().startswith(kw + ','):
-            return True
-    # Filter: gpt has heavy repetition (same 50-char block appears 3+ times)
-    if len(gpt) > 200:
-        block = gpt[:50]
-        if gpt.count(block) >= 3:
-            return True
-    # Filter: gpt too short (< 2 chars)
-    if len(gpt.strip()) < 2:
-        return True
-    # Filter: empty human
-    if len(human.strip()) < 5:
-        return True
-    return False
-
-for src in ['self_qa']:
-    path = '${PROCESSED}/' + src + '.jsonl'
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            items = [json.loads(l) for l in f if l.strip()]
-        before = len(items)
-        items = [i for i in items if not is_dirty(i)]
-        with open(path, 'w', encoding='utf-8') as f:
-            for i in items:
-                f.write(json.dumps(i, ensure_ascii=False) + '\n')
-        print(f'  {src}: {before} -> {len(items)} ({before - len(items)} dirty removed)')
-    except FileNotFoundError:
-        print(f'  {src}: not found, skipping')
-"
-
 # --- Step 0.3: 多源合并 (按配比采样) ---
+# Removed: Self-QA (dirty data, thinking leaks, heavy repetition)
+# Removed: Sujet (mostly sentiment analysis, low training value)
 echo ""
 echo "[Step 0.3] Merging SFT datasets with target ratios..."
 python "${SCRIPTS}/data_processing/merge_sft_data.py" \
     --sources \
-        "baai_finance:${PROCESSED}/baai_finance.jsonl:0.35" \
-        "self_qa:${PROCESSED}/self_qa.jsonl:0.20" \
-        "alpaca_zh:${PROCESSED}/finance_alpaca_zh.jsonl:0.20" \
-        "sujet_zh:${PROCESSED}/sujet_finance_zh.jsonl:0.05" \
-        "general_zh:${PROCESSED}/general_zh.jsonl:0.20" \
+        "baai_finance:${PROCESSED}/baai_finance.jsonl:0.40" \
+        "alpaca_zh:${PROCESSED}/finance_alpaca_zh.jsonl:0.30" \
+        "general_zh:${PROCESSED}/general_zh.jsonl:0.30" \
     --total 50000 \
     --output "${PROCESSED}/merged_sft.jsonl" \
     --seed 42
@@ -122,50 +76,84 @@ echo "[Step 0.3.5] Global quality filtering..."
 python -c "
 import json, re
 
-THINKING_STARTS = ['嗯', '好的，我', '用户让我', '首先，我需要', '接下来', '让我', '我现在需要', '我需要']
+def has_repetition(text, min_block=30, max_count=2):
+    \"\"\"Check if any 30+ char block repeats 3+ times.\"\"\"
+    if len(text) < min_block * (max_count + 1):
+        return False
+    # Sliding window check
+    for start in range(0, min(len(text) - min_block, 500), 10):
+        block = text[start:start + min_block]
+        if text.count(block) > max_count:
+            return True
+    return False
+
+def is_mostly_chinese(text):
+    \"\"\"Check if text is mostly Chinese (>30% Chinese chars).\"\"\"
+    if not text:
+        return False
+    chinese = len(re.findall(r'[\u4e00-\u9fff]', text))
+    return chinese > len(text) * 0.15
 
 kept = 0
-dropped = 0
+dropped_reasons = {}
+
+def drop(reason):
+    global dropped_reasons
+    dropped_reasons[reason] = dropped_reasons.get(reason, 0) + 1
+
 with open('${PROCESSED}/merged_sft.jsonl', 'r', encoding='utf-8') as fin, \
      open('${PROCESSED}/merged_sft_clean.jsonl', 'w', encoding='utf-8') as fout:
     for line in fin:
         item = json.loads(line.strip())
         convs = item.get('conversations', [])
         if len(convs) < 2:
-            dropped += 1
+            drop('too_few_turns')
             continue
         human = next((m['value'] for m in convs if m.get('from') == 'human'), '')
         gpt = next((m['value'] for m in convs if m.get('from') == 'gpt'), '')
 
-        skip = False
-        # 1. Human is thinking content
-        for kw in THINKING_STARTS:
-            if human.strip().startswith(kw):
-                if '，' in human[:len(kw)+5] or '。' in human[:len(kw)+5]:
-                    skip = True
-                    break
-        # 2. GPT has heavy repetition
-        if not skip and len(gpt) > 300:
-            block = gpt[50:100]
-            if block and gpt.count(block) >= 3:
-                skip = True
-        # 3. GPT too short
-        if not skip and len(gpt.strip()) < 2:
-            skip = True
-        # 4. Human too short
-        if not skip and len(human.strip()) < 5:
-            skip = True
-        # 5. Contains thinking tags in GPT
-        if not skip and '<think>' in gpt:
-            skip = True
+        # 1. Human too short
+        if len(human.strip()) < 5:
+            drop('human_too_short')
+            continue
+        # 2. GPT too short (< 5 chars, filters sentiment labels)
+        if len(gpt.strip()) < 5:
+            drop('gpt_too_short')
+            continue
+        # 3. GPT has heavy repetition (sliding window check)
+        if has_repetition(gpt):
+            drop('gpt_repetition')
+            continue
+        # 4. Contains thinking tags or thinking patterns in GPT
+        if '<think>' in gpt or '</think>' in gpt:
+            drop('thinking_tags')
+            continue
+        # 5. GPT contains meta/reference phrases (from Self-QA artifacts)
+        meta_phrases = ['根据参考文本', '参考文本：', '分析解释：', '知识点】', '考点】', '考察方向】']
+        if any(p in gpt for p in meta_phrases):
+            drop('meta_content')
+            continue
+        # 6. Human is thinking content
+        thinking_starts = ['嗯，', '好的，我', '用户让我', '我现在需要', '问题应覆盖', '第二个要求']
+        if any(human.strip().startswith(s) for s in thinking_starts):
+            drop('human_thinking')
+            continue
+        # 7. Non-Chinese content (English not translated)
+        if not is_mostly_chinese(human + gpt):
+            drop('not_chinese')
+            continue
+        # 8. GPT is truncated garbage (ends mid-sentence with no punctuation)
+        if len(gpt) > 50 and gpt[-1] not in '。！？）」】\"\\'\\n' and not gpt[-1].isalnum():
+            drop('truncated')
+            continue
 
-        if skip:
-            dropped += 1
-        else:
-            fout.write(json.dumps(item, ensure_ascii=False) + '\n')
-            kept += 1
+        fout.write(json.dumps(item, ensure_ascii=False) + '\n')
+        kept += 1
 
-print(f'  Global filter: kept={kept}, dropped={dropped}')
+total_dropped = sum(dropped_reasons.values())
+print(f'  Global filter: kept={kept}, dropped={total_dropped}')
+for reason, count in sorted(dropped_reasons.items(), key=lambda x: -x[1]):
+    print(f'    {reason}: {count}')
 "
 mv "${PROCESSED}/merged_sft_clean.jsonl" "${PROCESSED}/merged_sft.jsonl"
 
