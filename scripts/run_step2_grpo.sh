@@ -47,7 +47,7 @@ python "${PROJECT_ROOT}/scripts/training/grpo_training.py" \
     --max_grad_norm 0.5 \
     --bf16 True \
     --logging_steps 10 \
-    --save_steps 200 \
+    --save_steps 100 \
     --logging_dir "${LOG_DIR}" \
     --report_to tensorboard \
     --format_reward_weight 1.0 \
