@@ -34,7 +34,7 @@ for MODEL_NAME in "base" "sft" "grpo"; do
     if [ -d "${MODEL_PATH}" ]; then
         lm_eval --model hf \
             --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
-            --tasks ceval-valid_finance,ceval-valid_tax_accountant,ceval-valid_economics \
+            --tasks ceval-valid_accountant,ceval-valid_college_economics,ceval-valid_business_administration \
             --device cuda:0 \
             --batch_size 1 \
             --output_path "${RESULTS_DIR}/ceval_finance_${MODEL_NAME}" \
@@ -58,7 +58,7 @@ for MODEL_NAME in "base" "sft" "grpo"; do
     if [ -d "${MODEL_PATH}" ]; then
         lm_eval --model hf \
             --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
-            --tasks ceval-valid_college_physics,ceval-valid_college_chemistry,ceval-valid_college_mathematics,ceval-valid_computer_architecture,ceval-valid_chinese_language_and_literature,ceval-valid_modern_chinese_history,ceval-valid_legal_professional \
+            --tasks ceval-valid_college_physics,ceval-valid_college_chemistry,ceval-valid_advanced_mathematics,ceval-valid_computer_architecture,ceval-valid_chinese_language_and_literature,ceval-valid_high_school_history,ceval-valid_law \
             --device cuda:0 \
             --batch_size 1 \
             --output_path "${RESULTS_DIR}/ceval_general_${MODEL_NAME}" \
