@@ -213,7 +213,7 @@ def generate_qa(args, llm, tokenizer):
 # Cross-validation: verify answers with a different model
 # ============================================================
 
-VERIFY_PROMPT = "请计算以下金融题目的答案，只输出最终数值结果（如：72、11580元、-5、13.56万元、15.3%），不要输出推理过程或其他内容。\n\n题目：{prompt}"
+VERIFY_PROMPT = "请计算以下金融题目的答案，只输出最终数值结果（如：72、11580元、-5、13.56万元、15.3%），不要输出推理过程。\n\n题目：{prompt}"
 
 
 def normalize_answer(s: str) -> str:
@@ -298,18 +298,31 @@ def cross_validate(items: List[dict], verify_model_path: str, tp: int, gpu_util:
         prompts.append(build_chat_prompt(verify_tokenizer, user_msg))
 
     # DeepSeek-R1 outputs <think>...</think> before the answer,
-    # so we need enough tokens for both thinking and answer
-    params = SamplingParams(temperature=0, max_tokens=1024)
+    # need enough tokens for thinking + answer. R1 thinking can be very long.
+    params = SamplingParams(temperature=0, max_tokens=3072)
     outputs = verify_llm.generate(prompts, params)
 
     verified = []
     mismatch = 0
+    truncated = 0
     mismatch_examples = []
     for item, out in zip(items, outputs):
         verify_answer = out.outputs[0].text.strip()
+
         # Strip thinking tags (DeepSeek-R1 always outputs <think>...</think>)
         if "</think>" in verify_answer:
             verify_answer = verify_answer.split("</think>")[-1].strip()
+        elif "<think>" in verify_answer and "</think>" not in verify_answer:
+            # Thinking was truncated (didn't finish), try to extract number from end
+            truncated += 1
+            # Look for numbers in the last 200 chars
+            tail = verify_answer[-200:]
+            nums = re.findall(r'[-+]?\d+\.?\d*\s*(?:万元|亿元|元|%|万|亿)?', tail)
+            if nums:
+                verify_answer = nums[-1].strip()
+            else:
+                mismatch += 1
+                continue
 
         gt = item["ground_truth"]
         if not gt:
@@ -328,7 +341,8 @@ def cross_validate(items: List[dict], verify_model_path: str, tp: int, gpu_util:
                 })
 
     logger.info(f"Cross-validation: {len(items)} -> {len(verified)} "
-                f"({mismatch} mismatches removed, {len(verified)/max(len(items),1):.1%} kept)")
+                f"({mismatch} mismatches, {truncated} truncated thinking, "
+                f"{len(verified)/max(len(items),1):.1%} kept)")
 
     if mismatch_examples:
         logger.info("Mismatch examples:")
