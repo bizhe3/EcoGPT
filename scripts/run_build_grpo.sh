@@ -15,7 +15,7 @@ set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-MODEL="${PROJECT_ROOT}/models/base/DeepSeek-R1-Distill-Qwen-14B"
+MODEL="${PROJECT_ROOT}/models/base/Qwen3-14B"
 INPUT="${PROJECT_ROOT}/data/sft/processed/self_qa_reasoning.jsonl"
 OUTPUT="${PROJECT_ROOT}/data/grpo/train/grpo_all.jsonl"
 NUM_GENERATE=10000
