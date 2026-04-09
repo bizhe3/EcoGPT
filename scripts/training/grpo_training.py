@@ -228,12 +228,32 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load dataset
+    # Load dataset and format prompts with system instruction
+    SYSTEM_PROMPT = (
+        "你是一个专业的金融分析助手。请先在<think>标签中进行分析推理，"
+        "然后在<answer>标签中给出最终答案。\n"
+        "格式：<think>你的推理过程</think><answer>最终答案</answer>"
+    )
+
+    def format_prompt(example):
+        """Wrap raw prompt into chat format with system instruction."""
+        prompt = example["prompt"]
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        formatted = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        return {"prompt": formatted}
+
     train_dataset = load_grpo_data(args.train_data_path, args.max_train_samples)
+    train_dataset = train_dataset.map(format_prompt)
 
     eval_dataset = None
     if args.val_data_path and os.path.exists(args.val_data_path):
         eval_dataset = load_grpo_data(args.val_data_path)
+        eval_dataset = eval_dataset.map(format_prompt)
 
     # Configure GRPO
     grpo_config = GRPOConfig(

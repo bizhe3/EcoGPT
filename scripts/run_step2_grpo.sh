@@ -38,7 +38,7 @@ python "${PROJECT_ROOT}/scripts/training/grpo_training.py" \
     --num_generations 8 \
     --temperature 0.9 \
     --use_vllm True \
-    --max_completion_length 512 \
+    --max_completion_length 1024 \
     --beta 0.04 \
     --loss_type grpo \
     --learning_rate 5e-6 \
