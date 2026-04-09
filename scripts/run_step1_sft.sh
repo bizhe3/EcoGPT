@@ -41,6 +41,7 @@ echo "  Val:    ${VAL_DIR}"
 echo "  Output: ${OUTPUT_DIR}"
 echo ""
 
+PYTHONPATH="${PROJECT_ROOT}/scripts/utils:${PYTHONPATH}" \
 python "${PROJECT_ROOT}/scripts/training/supervised_finetuning.py" \
     --model_name_or_path "${MODEL_PATH}" \
     --template_name qwen \
