@@ -18,7 +18,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODEL="${PROJECT_ROOT}/models/base/Qwen3-14B"
 INPUT="${PROJECT_ROOT}/data/sft/processed/self_qa_reasoning.jsonl"
 OUTPUT="${PROJECT_ROOT}/data/grpo/train/grpo_all.jsonl"
-NUM_GENERATE=10000
+NUM_GENERATE=20000
 
 echo "============================================"
 echo "  EcoGPT: Build GRPO Data (R1 Distill)"
