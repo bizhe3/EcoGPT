@@ -58,7 +58,7 @@ for MODEL_NAME in "base" "sft" "grpo"; do
     if [ -d "${MODEL_PATH}" ]; then
         lm_eval --model hf \
             --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
-            --tasks ceval-valid_college_physics,ceval-valid_computer_architecture \
+            --tasks ceval-valid_college_physics,ceval-valid_college_chemistry,ceval-valid_college_mathematics,ceval-valid_computer_architecture,ceval-valid_chinese_language_and_literature,ceval-valid_modern_chinese_history,ceval-valid_legal_professional \
             --device cuda:0 \
             --batch_size 1 \
             --output_path "${RESULTS_DIR}/ceval_general_${MODEL_NAME}" \
