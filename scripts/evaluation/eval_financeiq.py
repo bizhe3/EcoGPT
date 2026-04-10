@@ -29,46 +29,61 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def load_financeiq(data_dir: str):
-    """Load FinanceIQ data from CSV files."""
+    """Load FinanceIQ data from CSV files.
+
+    FinanceIQ structure:
+      data_dir/
+        dev/   (few-shot examples, skip)
+        test/  (evaluation questions)
+          保险从业资格CICE.csv
+          基金从业资格.csv
+          ...
+
+    CSV format: ,Question,A,B,C,D,Answer
+    """
     import csv
 
     all_samples = []
     categories = defaultdict(list)
 
-    csv_files = glob(os.path.join(data_dir, "**/*.csv"), recursive=True)
+    # Prefer test/ subdirectory
+    test_dir = os.path.join(data_dir, "test")
+    search_dir = test_dir if os.path.isdir(test_dir) else data_dir
+
+    csv_files = glob(os.path.join(search_dir, "**/*.csv"), recursive=True)
+
     if not csv_files:
-        # Try jsonl format
-        jsonl_files = glob(os.path.join(data_dir, "**/*.jsonl"), recursive=True)
-        for fpath in jsonl_files:
-            category = os.path.splitext(os.path.basename(fpath))[0]
-            with open(fpath, "r", encoding="utf-8") as f:
-                for line in f:
-                    item = json.loads(line.strip())
-                    item["category"] = category
-                    all_samples.append(item)
-                    categories[category].append(item)
-        return all_samples, dict(categories)
+        # Fallback: try all CSV in data_dir
+        csv_files = glob(os.path.join(data_dir, "**/*.csv"), recursive=True)
+
+    logger.info(f"Found {len(csv_files)} CSV files in {search_dir}")
 
     for fpath in csv_files:
         category = os.path.splitext(os.path.basename(fpath))[0]
         with open(fpath, "r", encoding="utf-8") as f:
             reader = csv.DictReader(f)
+            count = 0
             for row in reader:
+                # Skip rows without valid question or answer
+                if not row.get("Question") or not row.get("Answer"):
+                    continue
                 row["category"] = category
                 all_samples.append(row)
                 categories[category].append(row)
+                count += 1
+            logger.info(f"  {category}: {count} questions")
 
     return all_samples, dict(categories)
 
 
 def format_question(item: dict) -> str:
     """Format a multiple-choice question as prompt."""
-    question = item.get("question", item.get("题目", ""))
+    # FinanceIQ uses "Question" (capitalized)
+    question = item.get("Question", item.get("question", item.get("题目", "")))
     options = []
 
-    # Try different field names
     for key in ["A", "B", "C", "D", "E"]:
-        val = item.get(key, item.get(f"选项{key}", ""))
+        val = item.get(key, "")
         if val:
             options.append(f"{key}. {val}")
 
@@ -78,9 +93,9 @@ def format_question(item: dict) -> str:
 
 def get_answer(item: dict) -> str:
     """Extract correct answer from item."""
-    answer = item.get("answer", item.get("答案", ""))
-    # Normalize to single letter
-    answer = answer.strip().upper()
+    # FinanceIQ uses "Answer" (capitalized)
+    answer = item.get("Answer", item.get("answer", item.get("答案", "")))
+    answer = str(answer).strip().upper()
     if answer and answer[0] in "ABCDE":
         return answer[0]
     return answer
