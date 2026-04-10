@@ -32,6 +32,9 @@ GRPO_MODEL="${PROJECT_ROOT}/models/grpo_merged"
 
 MODELS=("base:${BASE_MODEL}" "sft:${SFT_MODEL}" "grpo:${GRPO_MODEL}")
 
+# ---- vLLM common args for lm-eval ----
+VLLM_ARGS="trust_remote_code=True,tensor_parallel_size=2,dtype=bfloat16,gpu_memory_utilization=0.9"
+
 echo "============================================"
 echo "  EcoGPT Step 3: Full Benchmark Evaluation"
 echo "============================================"
@@ -79,11 +82,10 @@ for entry in "${MODELS[@]}"; do
     MODEL_PATH="${entry##*:}"
     echo "  Evaluating ${MODEL_NAME}"
     if [ -d "${MODEL_PATH}" ]; then
-        lm_eval --model hf \
-            --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
+        lm_eval --model vllm \
+            --model_args "pretrained=${MODEL_PATH},${VLLM_ARGS}" \
             --tasks ceval-valid_accountant,ceval-valid_college_economics,ceval-valid_business_administration \
-            --device cuda:0 \
-            --batch_size 1 \
+            --batch_size auto \
             --output_path "${RESULTS_DIR}/ceval_finance_${MODEL_NAME}" \
             2>&1 | tee "${RESULTS_DIR}/ceval_finance_${MODEL_NAME}.log" \
             || echo "  [WARN] CEVAL finance failed for ${MODEL_NAME}"
@@ -102,11 +104,10 @@ for entry in "${MODELS[@]}"; do
     MODEL_PATH="${entry##*:}"
     echo "  Evaluating ${MODEL_NAME}"
     if [ -d "${MODEL_PATH}" ]; then
-        lm_eval --model hf \
-            --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
+        lm_eval --model vllm \
+            --model_args "pretrained=${MODEL_PATH},${VLLM_ARGS}" \
             --tasks ceval-valid_college_physics,ceval-valid_college_chemistry,ceval-valid_advanced_mathematics,ceval-valid_computer_architecture,ceval-valid_chinese_language_and_literature,ceval-valid_high_school_history,ceval-valid_law \
-            --device cuda:0 \
-            --batch_size 1 \
+            --batch_size auto \
             --output_path "${RESULTS_DIR}/ceval_general_${MODEL_NAME}" \
             2>&1 | tee "${RESULTS_DIR}/ceval_general_${MODEL_NAME}.log" \
             || echo "  [WARN] CEVAL general failed for ${MODEL_NAME}"
@@ -125,11 +126,11 @@ for entry in "${MODELS[@]}"; do
     MODEL_PATH="${entry##*:}"
     echo "  Evaluating ${MODEL_NAME}"
     if [ -d "${MODEL_PATH}" ]; then
-        lm_eval --model hf \
-            --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
+        lm_eval --model vllm \
+            --model_args "pretrained=${MODEL_PATH},${VLLM_ARGS}" \
             --tasks cmmlu \
-            --device cuda:0 \
-            --batch_size 1 \
+            --batch_size auto \
+            --trust_remote_code \
             --output_path "${RESULTS_DIR}/cmmlu_${MODEL_NAME}" \
             2>&1 | tee "${RESULTS_DIR}/cmmlu_${MODEL_NAME}.log" \
             || echo "  [WARN] CMMLU failed for ${MODEL_NAME}"
@@ -148,11 +149,10 @@ for entry in "${MODELS[@]}"; do
     MODEL_PATH="${entry##*:}"
     echo "  Evaluating ${MODEL_NAME}"
     if [ -d "${MODEL_PATH}" ]; then
-        lm_eval --model hf \
-            --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
+        lm_eval --model vllm \
+            --model_args "pretrained=${MODEL_PATH},${VLLM_ARGS}" \
             --tasks gsm8k,mgsm_direct_zh \
-            --device cuda:0 \
-            --batch_size 1 \
+            --batch_size auto \
             --output_path "${RESULTS_DIR}/math_${MODEL_NAME}" \
             2>&1 | tee "${RESULTS_DIR}/math_${MODEL_NAME}.log" \
             || echo "  [WARN] Math eval failed for ${MODEL_NAME}"
