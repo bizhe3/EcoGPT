@@ -142,7 +142,7 @@ done
 # 3.5 Math Reasoning (GSM8K + MGSM-zh)
 # ============================================================
 echo ""
-echo "[3.5] Math Reasoning (GSM8K + MGSM Chinese)"
+echo "[3.5] Math Reasoning (GSM8K + MGSM-zh)"
 for entry in "${MODELS[@]}"; do
     MODEL_NAME="${entry%%:*}"
     MODEL_PATH="${entry##*:}"
@@ -150,7 +150,7 @@ for entry in "${MODELS[@]}"; do
     if [ -d "${MODEL_PATH}" ]; then
         lm_eval --model hf \
             --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
-            --tasks gsm8k,mgsm_zh \
+            --tasks gsm8k,mgsm_direct_zh \
             --device cuda:0 \
             --batch_size 1 \
             --output_path "${RESULTS_DIR}/math_${MODEL_NAME}" \
