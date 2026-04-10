@@ -139,10 +139,33 @@ for entry in "${MODELS[@]}"; do
 done
 
 # ============================================================
-# 3.5 GRPO Financial Calculation Accuracy
+# 3.5 Math Reasoning (GSM8K + MGSM-zh)
 # ============================================================
 echo ""
-echo "[3.5] Financial Calculation Accuracy (GRPO validation set)"
+echo "[3.5] Math Reasoning (GSM8K + MGSM Chinese)"
+for entry in "${MODELS[@]}"; do
+    MODEL_NAME="${entry%%:*}"
+    MODEL_PATH="${entry##*:}"
+    echo "  Evaluating ${MODEL_NAME}"
+    if [ -d "${MODEL_PATH}" ]; then
+        lm_eval --model hf \
+            --model_args "pretrained=${MODEL_PATH},trust_remote_code=True" \
+            --tasks gsm8k,mgsm_zh \
+            --device cuda:0 \
+            --batch_size 1 \
+            --output_path "${RESULTS_DIR}/math_${MODEL_NAME}" \
+            2>&1 | tee "${RESULTS_DIR}/math_${MODEL_NAME}.log" \
+            || echo "  [WARN] Math eval failed for ${MODEL_NAME}"
+    else
+        echo "  [SKIP] ${MODEL_PATH}"
+    fi
+done
+
+# ============================================================
+# 3.6 GRPO Financial Calculation Accuracy
+# ============================================================
+echo ""
+echo "[3.6] Financial Calculation Accuracy (GRPO validation set)"
 GRPO_VAL="${PROJECT_ROOT}/data/grpo/val/valid.jsonl"
 if [ -f "${GRPO_VAL}" ]; then
     for entry in "${MODELS[@]}"; do
@@ -179,9 +202,10 @@ echo "============================================"
 echo "  Results directory: ${RESULTS_DIR}/"
 echo ""
 echo "  Benchmarks completed:"
-echo "    3.1  FinanceIQ        (financial knowledge)"
-echo "    3.2  CEVAL Financial  (financial knowledge)"
-echo "    3.3  CEVAL General    (regression test)"
-echo "    3.4  CMMLU            (general capability)"
-echo "    3.5  GRPO Calculation (reasoning accuracy)"
+echo "    3.1  FinanceIQ        (financial knowledge, 7173 questions)"
+echo "    3.2  CEVAL Financial  (financial knowledge, 3 subjects)"
+echo "    3.3  CEVAL General    (regression test, 7 subjects)"
+echo "    3.4  CMMLU            (general capability, ~11K questions)"
+echo "    3.5  GSM8K + MGSM-zh  (math reasoning)"
+echo "    3.6  GRPO Calculation (financial reasoning, 274 questions)"
 echo "============================================"
