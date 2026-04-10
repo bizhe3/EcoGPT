@@ -18,10 +18,10 @@ import json
 import os
 import re
 
-import torch
 from loguru import logger
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
 
 
 def extract_number(s: str):
@@ -75,7 +75,8 @@ def main():
     ap.add_argument("--data", required=True, help="GRPO validation jsonl")
     ap.add_argument("--output", required=True, help="Output JSON file")
     ap.add_argument("--max_samples", type=int, default=None)
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--tensor_parallel_size", type=int, default=1, help="Number of GPUs for tensor parallelism")
+    ap.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -93,48 +94,56 @@ def main():
 
     logger.info(f"Loaded {len(samples)} calculation problems")
 
-    # Load model
-    logger.info(f"Loading model: {args.model}")
+    # Load tokenizer (for prompt formatting)
+    logger.info(f"Loading tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True,
-        torch_dtype=torch.bfloat16, device_map=args.device,
-    ).eval()
 
-    # Evaluate
+    # Prepare all prompts
+    all_prompts = []
+    all_gts = []
+    for item in samples:
+        messages = [
+            {"role": "system", "content": "你是一个专业的金融分析助手。请仔细分析问题并给出准确的答案。"},
+            {"role": "user", "content": item["prompt"]},
+        ]
+        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        all_prompts.append(text)
+        all_gts.append(item["ground_truth"])
+
+    # Initialize vLLM engine
+    logger.info(f"Loading vLLM model: {args.model}")
+    llm = LLM(
+        model=args.model,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        max_model_len=2048,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=1024,
+        temperature=0.1,
+    )
+
+    # Batch generate
+    logger.info("Running batch inference...")
+    outputs = llm.generate(all_prompts, sampling_params)
+
+    # Score
     correct = 0
     total = 0
     details = []
 
-    for item in tqdm(samples, desc="Evaluating"):
-        prompt = item["prompt"]
-        gt = item["ground_truth"]
-
-        messages = [
-            {"role": "system", "content": "你是一个专业的金融分析助手。请仔细分析问题并给出准确的答案。"},
-            {"role": "user", "content": prompt},
-        ]
-        text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
-        inputs = {k: v.to(args.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=1024,
-                temperature=0.1,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-
+    for output, gt, item in zip(outputs, all_gts, samples):
+        response = output.outputs[0].text
         matched = answer_matches(response, gt)
         if matched:
             correct += 1
         total += 1
 
         details.append({
-            "prompt": prompt[:100],
+            "prompt": item["prompt"][:100],
             "ground_truth": gt,
             "prediction": response[:200],
             "correct": matched,

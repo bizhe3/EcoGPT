@@ -32,10 +32,10 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-import torch
 from loguru import logger
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
+from vllm import LLM, SamplingParams
 
 CHOICES = ["A", "B", "C", "D"]
 
@@ -136,18 +136,17 @@ def extract_choice(response):
 # Evaluation
 # ============================================================
 
-def evaluate_generate(model, tokenizer, dev_df, test_df, subject,
-                      num_few_shot, max_length, device, use_chat_template=False):
-    """Evaluate using generate + extract_choice (XuanYuan method)."""
-    cors = []
-    all_preds = []
+def prepare_prompts(tokenizer, dev_df, test_df, subject,
+                    num_few_shot, max_length, use_chat_template=False):
+    """Prepare all prompts and labels for batch inference."""
+    prompts = []
+    labels = []
 
     for i in range(len(test_df)):
         prompt_end = format_example(test_df, i, subject, include_answer=False)
         prompt = gen_prompt(dev_df, subject, prompt_end, num_few_shot, tokenizer, max_length)
         label = str(test_df.iloc[i, test_df.shape[1] - 1]).strip()
 
-        # For chat models, wrap in chat template
         if use_chat_template:
             messages = [{"role": "user", "content": prompt}]
             try:
@@ -162,25 +161,23 @@ def evaluate_generate(model, tokenizer, dev_df, test_df, subject,
         else:
             text = prompt
 
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+        prompts.append(text)
+        labels.append(label)
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=64,
-                temperature=0.1,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-        response = tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1]:],
-            skip_special_tokens=True,
-        )
+    return prompts, labels
 
+
+def evaluate_batch(llm, prompts, labels, sampling_params):
+    """Evaluate using vLLM batch inference."""
+    cors = []
+    all_preds = []
+
+    outputs = llm.generate(prompts, sampling_params)
+
+    for output, label in zip(outputs, labels):
+        response = output.outputs[0].text
         pred = extract_choice(response)
         all_preds.append(pred)
-
         if label in CHOICES:
             cors.append(pred == label)
 
@@ -197,7 +194,8 @@ def main():
     ap.add_argument("--max_length", type=int, default=2048)
     ap.add_argument("--use_chat_template", action="store_true", default=True,
                     help="Use chat template for chat models")
-    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--tensor_parallel_size", type=int, default=1, help="Number of GPUs for tensor parallelism")
+    ap.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -217,34 +215,70 @@ def main():
 
     logger.info(f"Found {len(subjects)} subjects: {subjects}")
 
-    # Load model
-    logger.info(f"Loading model: {args.model}")
+    # Load tokenizer (for prompt formatting)
+    logger.info(f"Loading tokenizer: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True,
-        torch_dtype=torch.bfloat16, device_map=args.device,
-    ).eval()
 
-    # Evaluate each subject
-    all_acc = {}
-    total_correct = 0
-    total_questions = 0
+    # Collect ALL prompts across all subjects for one big batch
+    all_prompts = []
+    all_labels = []
+    subject_ranges = {}  # subject -> (start_idx, end_idx)
 
-    for i, subject in enumerate(subjects):
-        logger.info(f"Evaluating {i+1}/{len(subjects)}: {subject}")
-
+    for subject in subjects:
         test_df = pd.read_csv(os.path.join(test_dir, subject + ".csv"), header=0, index_col=0)
         dev_df = None
         dev_path = os.path.join(dev_dir, subject + ".csv")
         if os.path.exists(dev_path):
             dev_df = pd.read_csv(dev_path, header=0, index_col=0)
 
-        acc, cors, preds = evaluate_generate(
-            model, tokenizer, dev_df, test_df, subject,
-            args.num_few_shot, args.max_length, args.device,
+        start_idx = len(all_prompts)
+        prompts, labels = prepare_prompts(
+            tokenizer, dev_df, test_df, subject,
+            args.num_few_shot, args.max_length,
             use_chat_template=args.use_chat_template,
         )
+        all_prompts.extend(prompts)
+        all_labels.extend(labels)
+        subject_ranges[subject] = (start_idx, len(all_prompts))
 
+    logger.info(f"Total prompts to evaluate: {len(all_prompts)}")
+
+    # Initialize vLLM engine (single load, batch all subjects)
+    logger.info(f"Loading vLLM model: {args.model}")
+    llm = LLM(
+        model=args.model,
+        trust_remote_code=True,
+        dtype="bfloat16",
+        max_model_len=args.max_length,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
+
+    sampling_params = SamplingParams(
+        max_tokens=64,
+        temperature=0.1,
+    )
+
+    # Batch generate ALL at once
+    logger.info("Running batch inference...")
+    outputs = llm.generate(all_prompts, sampling_params)
+
+    # Score per subject
+    all_acc = {}
+    total_correct = 0
+    total_questions = 0
+
+    for subject in subjects:
+        start, end = subject_ranges[subject]
+        cors = []
+        for idx in range(start, end):
+            response = outputs[idx].outputs[0].text
+            pred = extract_choice(response)
+            label = all_labels[idx]
+            if label in CHOICES:
+                cors.append(pred == label)
+
+        acc = np.mean(cors) if cors else 0.0
         all_acc[subject] = acc
         total_correct += sum(cors)
         total_questions += len(cors)

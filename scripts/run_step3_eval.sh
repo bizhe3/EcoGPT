@@ -56,7 +56,7 @@ if [ -d "${FINANCEIQ_DIR}" ] && [ "$(ls -A ${FINANCEIQ_DIR} 2>/dev/null)" ]; the
                 --model "${MODEL_PATH}" \
                 --data "${FINANCEIQ_DIR}" \
                 --output "${RESULTS_DIR}/financeiq_${MODEL_NAME}.json" \
-                --device cuda:0 \
+                --tensor_parallel_size 2 \
                 2>&1 | tee "${RESULTS_DIR}/financeiq_${MODEL_NAME}.log" \
                 || echo "  [WARN] FinanceIQ eval failed for ${MODEL_NAME}"
         else
@@ -181,7 +181,7 @@ if [ -f "${GRPO_VAL}" ]; then
                 --model "${MODEL_PATH}" \
                 --data "${GRPO_VAL}" \
                 --output "${RESULTS_DIR}/grpo_calc_${MODEL_NAME}.json" \
-                --device cuda:0 \
+                --tensor_parallel_size 2 \
                 2>&1 | tee "${RESULTS_DIR}/grpo_calc_${MODEL_NAME}.log" \
                 || echo "  [WARN] GRPO calc eval failed for ${MODEL_NAME}"
         else
