@@ -71,18 +71,25 @@ def load_sft_data(input_path: str, max_samples: int = None):
 # Embedding
 # ============================================================
 
-def compute_embeddings(texts, model_name, cache_path=None, batch_size=64):
-    """Compute embeddings using BGE-large-zh-v1.5."""
+def compute_embeddings(texts, model_name, cache_path=None, batch_size=64, device="cuda"):
+    """Compute embeddings using BGE-large-zh-v1.5. Defaults to CUDA; falls back to CPU only if GPU unavailable."""
     if cache_path and os.path.exists(cache_path):
         logger.info(f"Loading cached embeddings from {cache_path}")
         return np.load(cache_path)
 
+    import torch
     from sentence_transformers import SentenceTransformer
 
-    logger.info(f"Loading embedding model: {model_name}")
-    model = SentenceTransformer(model_name, device="cuda")
+    if device == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available - falling back to CPU.")
+        logger.warning("For 40K samples on CPU, expect ~30-60 minutes.")
+        device = "cpu"
+        batch_size = min(batch_size, 16)
 
-    logger.info(f"Encoding {len(texts)} texts...")
+    logger.info(f"Loading embedding model: {model_name} on {device}")
+    model = SentenceTransformer(model_name, device=device)
+
+    logger.info(f"Encoding {len(texts)} texts (batch_size={batch_size})...")
     embeddings = model.encode(
         texts,
         batch_size=batch_size,
