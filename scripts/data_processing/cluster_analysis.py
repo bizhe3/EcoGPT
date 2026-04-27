@@ -1,41 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EcoGPT - SFT Data Clustering Analysis
+EcoGPT - SFT Data Clustering Analysis (Auto)
 
-Explore the structure and balance of SFT training data through clustering.
-
-Pipeline:
+Fully automatic clustering analysis:
   1. Load SFT data (jsonl with conversations format)
   2. Embed user questions using BGE-large-zh-v1.5
-  3. Reduce dimensionality with UMAP
-  4. Cluster with K-Means (or HDBSCAN)
-  5. Label clusters using Qwen3-14B (optional, requires vLLM)
-  6. Generate balance diagnostics + visualization
+  3. Auto-detect cluster count (HDBSCAN by default, or K-Means with auto-K via silhouette)
+  4. Auto-label every cluster (LLM if available, else TF-IDF keywords)
+  5. Generate balance diagnostics + UMAP visualization
 
 Usage:
-    # Basic usage
+    # Fully automatic (HDBSCAN + Qwen3-14B labels by default)
     python cluster_analysis.py \
         --input data/sft/train.jsonl \
         --output_dir outputs/cluster_analysis
 
-    # With LLM labeling
+    # Use a different LLM
     python cluster_analysis.py \
         --input data/sft/train.jsonl \
         --output_dir outputs/cluster_analysis \
-        --label_with_llm \
-        --llm_model models/base/Qwen3-14B
+        --llm_model models/base/Qwen3-7B
+
+    # Disable LLM, use TF-IDF keywords only (faster, no GPU needed)
+    python cluster_analysis.py \
+        --input data/sft/train.jsonl \
+        --output_dir outputs/cluster_analysis \
+        --llm_model none
 """
 
 import argparse
 import json
 import os
+import re
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 from loguru import logger
-from tqdm import tqdm
 
 
 # ============================================================
@@ -98,11 +100,44 @@ def compute_embeddings(texts, model_name, cache_path=None, batch_size=64):
 
 
 # ============================================================
-# Clustering
+# Auto clustering
 # ============================================================
 
-def find_optimal_k(embeddings, k_range=(10, 15, 20, 25, 30, 40), sample_size=5000):
-    """Use silhouette score to find optimal K."""
+def auto_cluster_hdbscan(embeddings, min_cluster_size=None, total=None):
+    """
+    Run HDBSCAN with auto-tuned min_cluster_size.
+
+    Heuristic: min_cluster_size = max(50, sqrt(N) / 2)
+    HDBSCAN automatically determines the number of clusters.
+    """
+    import hdbscan
+
+    n = total or len(embeddings)
+    if min_cluster_size is None:
+        # Heuristic: scale with dataset size
+        min_cluster_size = max(50, int(np.sqrt(n) / 2))
+    logger.info(f"HDBSCAN: min_cluster_size={min_cluster_size} (auto-tuned for N={n})")
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=10,
+        metric="euclidean",
+        cluster_selection_method="eom",
+        prediction_data=True,
+    )
+    labels = clusterer.fit_predict(embeddings)
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise = sum(1 for x in labels if x == -1)
+    logger.info(f"HDBSCAN found {n_clusters} clusters, {n_noise} noise points ({n_noise/n*100:.1f}%)")
+    return labels, None
+
+
+def auto_cluster_kmeans(embeddings, k_min=5, k_max=50, sample_size=5000):
+    """
+    Auto-detect K via silhouette score over a wide range.
+
+    Searches k_min to k_max with step=2, picks the K with highest silhouette.
+    """
     from sklearn.cluster import KMeans
     from sklearn.metrics import silhouette_score
 
@@ -113,8 +148,10 @@ def find_optimal_k(embeddings, k_range=(10, 15, 20, 25, 30, 40), sample_size=500
         sample = embeddings
 
     scores = {}
-    logger.info("Searching for optimal K...")
-    for k in k_range:
+    candidates = list(range(k_min, k_max + 1, 2))
+    logger.info(f"Searching optimal K in {k_min}-{k_max} (step=2, {len(candidates)} values)...")
+
+    for k in candidates:
         km = KMeans(n_clusters=k, random_state=42, n_init=5)
         labels = km.fit_predict(sample)
         score = silhouette_score(sample, labels, metric="cosine")
@@ -123,32 +160,11 @@ def find_optimal_k(embeddings, k_range=(10, 15, 20, 25, 30, 40), sample_size=500
 
     best_k = max(scores, key=scores.get)
     logger.info(f"Best k = {best_k} (silhouette={scores[best_k]:.4f})")
-    return best_k, scores
 
-
-def cluster_kmeans(embeddings, n_clusters):
-    """Run K-Means clustering."""
-    from sklearn.cluster import KMeans
-
-    logger.info(f"Running K-Means with n_clusters={n_clusters}...")
-    km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    logger.info(f"Running final K-Means with k={best_k}...")
+    km = KMeans(n_clusters=best_k, random_state=42, n_init=10)
     labels = km.fit_predict(embeddings)
     return labels, km.cluster_centers_
-
-
-def cluster_hdbscan(embeddings, min_cluster_size=200):
-    """Run HDBSCAN clustering (auto-determine cluster count)."""
-    import hdbscan
-
-    logger.info(f"Running HDBSCAN with min_cluster_size={min_cluster_size}...")
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=10,
-        metric="euclidean",
-        cluster_selection_method="eom",
-    )
-    labels = clusterer.fit_predict(embeddings)
-    return labels, None
 
 
 # ============================================================
@@ -159,18 +175,15 @@ def get_cluster_representatives(embeddings, centers, labels, texts, top_k=5):
     """For each cluster, find the K samples closest to the center."""
     representatives = {}
     for cluster_id in sorted(set(labels)):
-        if cluster_id == -1:  # HDBSCAN noise
+        if cluster_id == -1:
             continue
         cluster_idx = np.where(labels == cluster_id)[0]
         if centers is not None:
             center = centers[cluster_id]
-            distances = np.linalg.norm(embeddings[cluster_idx] - center, axis=1)
-            top_idx = cluster_idx[distances.argsort()[:top_k]]
         else:
-            # For HDBSCAN: use cluster centroid
             center = embeddings[cluster_idx].mean(axis=0)
-            distances = np.linalg.norm(embeddings[cluster_idx] - center, axis=1)
-            top_idx = cluster_idx[distances.argsort()[:top_k]]
+        distances = np.linalg.norm(embeddings[cluster_idx] - center, axis=1)
+        top_idx = cluster_idx[distances.argsort()[:top_k]]
         representatives[int(cluster_id)] = [texts[i] for i in top_idx]
     return representatives
 
@@ -198,7 +211,7 @@ def diagnose_balance(labels, total):
     max_min_ratio = sizes[0] / sizes[-1] if sizes[-1] > 0 else float("inf")
     noise_count = sum(1 for x in labels if x == -1)
 
-    diagnosis = {
+    return {
         "total_samples": total,
         "n_clusters": len(counter),
         "noise_samples": noise_count,
@@ -206,8 +219,8 @@ def diagnose_balance(labels, total):
         "max_cluster_size": sizes[0],
         "min_cluster_size": sizes[-1],
         "max_cluster_pct": sizes[0] / total * 100,
-        "max_min_ratio": max_min_ratio,
-        "gini_coefficient": gini,
+        "max_min_ratio": float(max_min_ratio),
+        "gini_coefficient": float(gini),
         "top3_pct": top3_pct,
         "balance_verdict": (
             "均衡" if gini < 0.3
@@ -215,11 +228,82 @@ def diagnose_balance(labels, total):
             else "失衡"
         ),
     }
-    return diagnosis
 
 
 # ============================================================
-# LLM labeling (optional)
+# Auto labeling - Method 1: TF-IDF keywords (no LLM needed)
+# ============================================================
+
+# Stopwords for Chinese
+ZH_STOPWORDS = set("""
+的 了 在 是 我 有 和 就 不 人 都 一 上 也 很 到 说 要 去 你 会 着 没有 看 好 自己 这
+那 它 他 她 们 个 之 与 及 以 或 但 而 等 啊 哦 嗯 呢 吧 吗 呀 哈 嘛 哟 唉 啦 罢 已经
+什么 怎么 为什么 如何 哪里 哪个 哪些 多少 几 谁 何 那么 这么 这样 那样 这种 那种
+请 是否 可以 能否 应该 需要 必须 最 比较 一些 一下 一点 几个 一般 通常 经常
+""".split())
+
+
+def tokenize_zh(text):
+    """Simple Chinese + English tokenizer using jieba if available, else char-level."""
+    try:
+        import jieba
+        return [w for w in jieba.cut(text) if len(w) > 1 and w not in ZH_STOPWORDS]
+    except ImportError:
+        # Fallback: extract Chinese 2-grams + English words
+        tokens = []
+        # English words
+        tokens.extend(re.findall(r"[A-Za-z]+", text))
+        # Chinese 2-grams
+        chinese = re.findall(r"[一-鿿]+", text)
+        for chunk in chinese:
+            for i in range(len(chunk) - 1):
+                bigram = chunk[i:i+2]
+                if bigram not in ZH_STOPWORDS:
+                    tokens.append(bigram)
+        return tokens
+
+
+def label_clusters_tfidf(representatives, top_n=5):
+    """
+    Label clusters using TF-IDF: extract top-N keywords per cluster.
+
+    Treats each cluster's concatenated representatives as a "document",
+    then identifies words distinctive to that cluster.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    cluster_ids = sorted(representatives.keys())
+    documents = []
+    for cid in cluster_ids:
+        # Concatenate representatives of this cluster
+        doc = " ".join([" ".join(tokenize_zh(s)) for s in representatives[cid]])
+        documents.append(doc)
+
+    if not documents or all(not d.strip() for d in documents):
+        return {cid: f"Cluster {cid}" for cid in cluster_ids}
+
+    vectorizer = TfidfVectorizer(
+        max_features=2000,
+        token_pattern=r"\S+",  # already tokenized
+        min_df=1,
+    )
+    try:
+        tfidf = vectorizer.fit_transform(documents)
+    except ValueError:
+        return {cid: f"Cluster {cid}" for cid in cluster_ids}
+
+    feature_names = vectorizer.get_feature_names_out()
+    labels = {}
+    for i, cid in enumerate(cluster_ids):
+        scores = tfidf[i].toarray().flatten()
+        top_indices = scores.argsort()[-top_n:][::-1]
+        keywords = [feature_names[idx] for idx in top_indices if scores[idx] > 0]
+        labels[cid] = " / ".join(keywords[:top_n]) if keywords else f"Cluster {cid}"
+    return labels
+
+
+# ============================================================
+# Auto labeling - Method 2: LLM (best quality)
 # ============================================================
 
 def label_clusters_with_llm(representatives, llm_model, tensor_parallel_size=1):
@@ -268,8 +352,7 @@ def label_clusters_with_llm(representatives, llm_model, tensor_parallel_size=1):
     for cid, output in zip(cluster_ids, outputs):
         text = output.outputs[0].text.strip()
         text = text.split("\n")[0].strip()[:30]
-        labels[cid] = text
-
+        labels[cid] = text if text else f"Cluster {cid}"
     return labels
 
 
@@ -277,8 +360,8 @@ def label_clusters_with_llm(representatives, llm_model, tensor_parallel_size=1):
 # Visualization
 # ============================================================
 
-def visualize(embeddings, labels, output_path, cluster_names=None):
-    """Generate UMAP 2D visualization."""
+def visualize(embeddings, labels, output_path, cluster_names):
+    """Generate UMAP 2D visualization. Always uses cluster_names."""
     import matplotlib.pyplot as plt
     import umap
 
@@ -293,16 +376,17 @@ def visualize(embeddings, labels, output_path, cluster_names=None):
 
     plt.figure(figsize=(14, 10))
     unique_labels = sorted(set(labels))
-    cmap = plt.cm.get_cmap("tab20", len(unique_labels))
+    cmap = plt.cm.get_cmap("tab20", max(len(unique_labels), 2))
 
     for i, label in enumerate(unique_labels):
         mask = labels == label
-        color = "lightgray" if label == -1 else cmap(i)
-        name = (
-            "noise" if label == -1
-            else f"#{label} {cluster_names[label]}" if cluster_names and label in cluster_names
-            else f"#{label}"
-        )
+        if label == -1:
+            color = "lightgray"
+            name = "noise"
+        else:
+            color = cmap(i)
+            label_name = cluster_names.get(label, f"#{label}")
+            name = f"#{label} {label_name}"
         plt.scatter(
             emb_2d[mask, 0], emb_2d[mask, 1],
             s=2, alpha=0.5, c=[color], label=name
@@ -311,7 +395,7 @@ def visualize(embeddings, labels, output_path, cluster_names=None):
     plt.title("SFT Data Cluster Distribution (UMAP)")
     plt.xlabel("UMAP 1")
     plt.ylabel("UMAP 2")
-    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8, markerscale=3)
+    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=7, markerscale=3)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -323,7 +407,7 @@ def visualize(embeddings, labels, output_path, cluster_names=None):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="SFT data clustering analysis")
+    parser = argparse.ArgumentParser(description="SFT data clustering analysis (auto)")
     parser.add_argument("--input", required=True, help="Input jsonl file")
     parser.add_argument("--output_dir", required=True, help="Output directory")
     parser.add_argument(
@@ -333,21 +417,9 @@ def main():
     )
     parser.add_argument(
         "--method",
-        choices=["kmeans", "hdbscan"],
-        default="kmeans",
-        help="Clustering algorithm",
-    )
-    parser.add_argument(
-        "--n_clusters",
-        type=int,
-        default=None,
-        help="Number of clusters for K-Means (auto if not set)",
-    )
-    parser.add_argument(
-        "--min_cluster_size",
-        type=int,
-        default=200,
-        help="Minimum cluster size for HDBSCAN",
+        choices=["hdbscan", "kmeans"],
+        default="hdbscan",
+        help="Clustering algorithm (hdbscan: truly automatic; kmeans: auto-K via silhouette)",
     )
     parser.add_argument(
         "--max_samples",
@@ -356,20 +428,15 @@ def main():
         help="Limit number of samples (for debugging)",
     )
     parser.add_argument(
-        "--label_with_llm",
-        action="store_true",
-        help="Use LLM to label cluster themes",
-    )
-    parser.add_argument(
         "--llm_model",
-        default=None,
-        help="LLM path for cluster labeling",
+        default="models/base/Qwen3-14B",
+        help="LLM path for cluster labeling. Default: Qwen3-14B. Set to 'none' to use TF-IDF instead.",
     )
     parser.add_argument(
         "--tensor_parallel_size",
         type=int,
-        default=1,
-        help="vLLM tensor parallel size for LLM labeling",
+        default=2,
+        help="vLLM tensor parallel size for LLM labeling (default: 2 for dual GPU)",
     )
     args = parser.parse_args()
 
@@ -385,29 +452,36 @@ def main():
         texts, args.embed_model, cache_path=str(cache_path)
     )
 
-    # ---- Step 3: Cluster ----
-    if args.method == "kmeans":
-        if args.n_clusters is None:
-            best_k, _ = find_optimal_k(embeddings)
-            args.n_clusters = best_k
-        labels, centers = cluster_kmeans(embeddings, args.n_clusters)
+    # ---- Step 3: Auto cluster (no manual K) ----
+    if args.method == "hdbscan":
+        labels, centers = auto_cluster_hdbscan(embeddings, total=len(texts))
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        # Fallback to K-Means if HDBSCAN finds too few clusters
+        if n_clusters < 3:
+            logger.warning(f"HDBSCAN only found {n_clusters} clusters, falling back to K-Means")
+            labels, centers = auto_cluster_kmeans(embeddings)
     else:
-        labels, centers = cluster_hdbscan(embeddings, args.min_cluster_size)
+        labels, centers = auto_cluster_kmeans(embeddings)
 
     # ---- Step 4: Get representatives ----
     representatives = get_cluster_representatives(
         embeddings, centers, labels, texts, top_k=5
     )
 
-    # ---- Step 5: Optional LLM labeling ----
-    cluster_names = None
-    if args.label_with_llm:
-        if not args.llm_model:
-            logger.error("--llm_model required when --label_with_llm")
-            return
-        cluster_names = label_clusters_with_llm(
-            representatives, args.llm_model, args.tensor_parallel_size
-        )
+    # ---- Step 5: Auto label every cluster (LLM by default, TF-IDF if explicitly disabled) ----
+    use_llm = args.llm_model and args.llm_model.lower() != "none"
+    if use_llm:
+        logger.info(f"Labeling clusters with LLM: {args.llm_model}")
+        try:
+            cluster_names = label_clusters_with_llm(
+                representatives, args.llm_model, args.tensor_parallel_size
+            )
+        except Exception as e:
+            logger.warning(f"LLM labeling failed: {e}, falling back to TF-IDF")
+            cluster_names = label_clusters_tfidf(representatives)
+    else:
+        logger.info("Labeling clusters with TF-IDF keywords (LLM explicitly disabled)...")
+        cluster_names = label_clusters_tfidf(representatives)
 
     # ---- Step 6: Diagnose balance ----
     diagnosis = diagnose_balance(labels, len(texts))
@@ -427,7 +501,7 @@ def main():
             "cluster_id": cid,
             "size": counter[cid],
             "percentage": counter[cid] / len(texts) * 100,
-            "name": cluster_names[cid] if cluster_names else f"Cluster {cid}",
+            "label": cluster_names.get(cid, f"Cluster {cid}"),
             "representatives": [s[:200] for s in representatives.get(cid, [])],
         }
         cluster_stats.append(stat)
@@ -437,7 +511,8 @@ def main():
     report = {
         "input": args.input,
         "method": args.method,
-        "n_clusters": args.n_clusters if args.method == "kmeans" else len(counter),
+        "n_clusters": len([c for c in counter if c != -1]),
+        "labeling_method": "llm" if use_llm else "tfidf",
         "diagnosis": diagnosis,
         "clusters": cluster_stats,
     }
@@ -450,17 +525,20 @@ def main():
     # ---- Markdown summary ----
     md_path = output_dir / "cluster_summary.md"
     with open(md_path, "w", encoding="utf-8") as f:
-        f.write(f"# SFT Data Cluster Analysis\n\n")
-        f.write(f"## Diagnosis\n\n")
+        f.write("# SFT Data Cluster Analysis\n\n")
+        f.write("## Diagnosis\n\n")
+        f.write(f"- Method: {args.method.upper()}\n")
+        f.write(f"- Labeling: {'LLM (' + args.llm_model + ')' if use_llm else 'TF-IDF keywords'}\n")
         f.write(f"- Total samples: {diagnosis['total_samples']}\n")
         f.write(f"- Clusters: {diagnosis['n_clusters']}\n")
+        f.write(f"- Noise: {diagnosis['noise_samples']} ({diagnosis['noise_pct']:.1f}%)\n")
         f.write(f"- Largest cluster: {diagnosis['max_cluster_size']} ({diagnosis['max_cluster_pct']:.1f}%)\n")
         f.write(f"- Top-3 coverage: {diagnosis['top3_pct']:.1f}%\n")
         f.write(f"- Gini coefficient: {diagnosis['gini_coefficient']:.3f}\n")
         f.write(f"- **Balance verdict: {diagnosis['balance_verdict']}**\n\n")
-        f.write(f"## Clusters (sorted by size)\n\n")
+        f.write("## Clusters (sorted by size)\n\n")
         for stat in cluster_stats:
-            f.write(f"### Cluster #{stat['cluster_id']}: {stat['name']} ")
+            f.write(f"### Cluster #{stat['cluster_id']}: {stat['label']} ")
             f.write(f"({stat['size']} samples, {stat['percentage']:.1f}%)\n\n")
             for i, rep in enumerate(stat["representatives"][:3]):
                 f.write(f"  {i+1}. {rep}\n")
@@ -474,7 +552,6 @@ def main():
     except Exception as e:
         logger.warning(f"Visualization failed: {e}")
 
-    # ---- Save labels for downstream use ----
     np.save(output_dir / "labels.npy", labels)
     logger.info(f"Done. Output dir: {output_dir}")
 
