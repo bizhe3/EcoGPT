@@ -88,7 +88,15 @@ echo "  HF endpoint:  ${HF_ENDPOINT}"
 echo "============================================"
 echo ""
 
+# ---- Check Python deps ----
+python -c "import hdbscan, umap, sklearn, sentence_transformers" 2>/dev/null || {
+    echo "[ERROR] Missing Python dependencies. Install with:"
+    echo "        pip install sentence-transformers umap-learn hdbscan jieba scikit-learn matplotlib"
+    exit 1
+}
+
 # ---- Run ----
+set -o pipefail   # propagate failure through pipe
 if [ "${USE_LLM}" = true ]; then
     python "${PROJECT_ROOT}/scripts/data_processing/cluster_analysis.py" \
         --input "${INPUT}" \
@@ -104,6 +112,14 @@ else
         --embed_model "${EMBED_MODEL}" \
         --llm_model none \
         2>&1 | tee "${OUTPUT_DIR}/run.log"
+fi
+
+PYTHON_EXIT=$?
+if [ "${PYTHON_EXIT}" -ne 0 ]; then
+    echo ""
+    echo "[ERROR] Cluster analysis failed with exit code ${PYTHON_EXIT}"
+    echo "        See log: ${OUTPUT_DIR}/run.log"
+    exit "${PYTHON_EXIT}"
 fi
 
 echo ""
