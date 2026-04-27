@@ -117,13 +117,15 @@ def auto_cluster_hdbscan(embeddings, min_cluster_size=None, total=None):
     Heuristic: min_cluster_size = max(50, sqrt(N) / 2)
     HDBSCAN automatically determines the number of clusters.
     """
+    import time
     import hdbscan
 
     n = total or len(embeddings)
     if min_cluster_size is None:
-        # Heuristic: scale with dataset size
         min_cluster_size = max(50, int(np.sqrt(n) / 2))
     logger.info(f"HDBSCAN: min_cluster_size={min_cluster_size} (auto-tuned for N={n})")
+    logger.info(f"HDBSCAN: starting clustering on {n} points × {embeddings.shape[1]} dims...")
+    logger.info(f"HDBSCAN: this is CPU-intensive, expected duration: 3-8 minutes for 30K-50K samples")
 
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
@@ -131,11 +133,16 @@ def auto_cluster_hdbscan(embeddings, min_cluster_size=None, total=None):
         metric="euclidean",
         cluster_selection_method="eom",
         prediction_data=True,
+        core_dist_n_jobs=-1,  # use all CPU cores
     )
+
+    t0 = time.time()
     labels = clusterer.fit_predict(embeddings)
+    elapsed = time.time() - t0
+
     n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
     n_noise = sum(1 for x in labels if x == -1)
-    logger.info(f"HDBSCAN found {n_clusters} clusters, {n_noise} noise points ({n_noise/n*100:.1f}%)")
+    logger.info(f"HDBSCAN finished in {elapsed:.1f}s: {n_clusters} clusters, {n_noise} noise points ({n_noise/n*100:.1f}%)")
     return labels, None
 
 
@@ -145,8 +152,10 @@ def auto_cluster_kmeans(embeddings, k_min=5, k_max=50, sample_size=5000):
 
     Searches k_min to k_max with step=2, picks the K with highest silhouette.
     """
+    import time
     from sklearn.cluster import KMeans
     from sklearn.metrics import silhouette_score
+    from tqdm import tqdm
 
     if len(embeddings) > sample_size:
         idx = np.random.RandomState(42).choice(len(embeddings), sample_size, replace=False)
@@ -156,21 +165,24 @@ def auto_cluster_kmeans(embeddings, k_min=5, k_max=50, sample_size=5000):
 
     scores = {}
     candidates = list(range(k_min, k_max + 1, 2))
-    logger.info(f"Searching optimal K in {k_min}-{k_max} (step=2, {len(candidates)} values)...")
+    logger.info(f"Searching optimal K in {k_min}-{k_max} (step=2, {len(candidates)} values, sample={len(sample)})...")
 
-    for k in candidates:
+    for k in tqdm(candidates, desc="K-Means search"):
         km = KMeans(n_clusters=k, random_state=42, n_init=5)
         labels = km.fit_predict(sample)
         score = silhouette_score(sample, labels, metric="cosine")
         scores[k] = score
-        logger.info(f"  k={k}: silhouette={score:.4f}")
 
+    for k in candidates:
+        logger.info(f"  k={k}: silhouette={scores[k]:.4f}")
     best_k = max(scores, key=scores.get)
     logger.info(f"Best k = {best_k} (silhouette={scores[best_k]:.4f})")
 
-    logger.info(f"Running final K-Means with k={best_k}...")
+    logger.info(f"Running final K-Means with k={best_k} on full dataset...")
+    t0 = time.time()
     km = KMeans(n_clusters=best_k, random_state=42, n_init=10)
     labels = km.fit_predict(embeddings)
+    logger.info(f"K-Means finished in {time.time() - t0:.1f}s")
     return labels, km.cluster_centers_
 
 
@@ -369,17 +381,21 @@ def label_clusters_with_llm(representatives, llm_model, tensor_parallel_size=1):
 
 def visualize(embeddings, labels, output_path, cluster_names):
     """Generate UMAP 2D visualization. Always uses cluster_names."""
+    import time
     import matplotlib.pyplot as plt
     import umap
 
     plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
 
-    logger.info("Running UMAP for visualization...")
+    logger.info(f"Running UMAP on {len(embeddings)} points (CPU-intensive, expected 1-3 min)...")
+    t0 = time.time()
     reducer = umap.UMAP(
-        n_neighbors=30, min_dist=0.1, metric="cosine", random_state=42
+        n_neighbors=30, min_dist=0.1, metric="cosine", random_state=42,
+        verbose=True,  # show UMAP progress
     )
     emb_2d = reducer.fit_transform(embeddings)
+    logger.info(f"UMAP finished in {time.time() - t0:.1f}s")
 
     plt.figure(figsize=(14, 10))
     unique_labels = sorted(set(labels))
@@ -450,32 +466,41 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- Step 1: Load data ----
+    logger.info("=" * 60)
+    logger.info("[1/6] Loading SFT data...")
+    logger.info("=" * 60)
     texts, _ = load_sft_data(args.input, max_samples=args.max_samples)
 
-    # ---- Step 2: Compute embeddings ----
+    logger.info("=" * 60)
+    logger.info("[2/6] Computing embeddings...")
+    logger.info("=" * 60)
     cache_path = output_dir / "embeddings.npy"
     embeddings = compute_embeddings(
         texts, args.embed_model, cache_path=str(cache_path)
     )
 
-    # ---- Step 3: Auto cluster (no manual K) ----
+    logger.info("=" * 60)
+    logger.info(f"[3/6] Clustering with {args.method.upper()}...")
+    logger.info("=" * 60)
     if args.method == "hdbscan":
         labels, centers = auto_cluster_hdbscan(embeddings, total=len(texts))
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-        # Fallback to K-Means if HDBSCAN finds too few clusters
         if n_clusters < 3:
             logger.warning(f"HDBSCAN only found {n_clusters} clusters, falling back to K-Means")
             labels, centers = auto_cluster_kmeans(embeddings)
     else:
         labels, centers = auto_cluster_kmeans(embeddings)
 
-    # ---- Step 4: Get representatives ----
+    logger.info("=" * 60)
+    logger.info("[4/6] Selecting cluster representatives...")
+    logger.info("=" * 60)
     representatives = get_cluster_representatives(
         embeddings, centers, labels, texts, top_k=5
     )
 
-    # ---- Step 5: Auto label every cluster (LLM by default, TF-IDF if explicitly disabled) ----
+    logger.info("=" * 60)
+    logger.info("[5/6] Labeling clusters...")
+    logger.info("=" * 60)
     use_llm = args.llm_model and args.llm_model.lower() != "none"
     if use_llm:
         logger.info(f"Labeling clusters with LLM: {args.llm_model}")
@@ -490,6 +515,9 @@ def main():
         logger.info("Labeling clusters with TF-IDF keywords (LLM explicitly disabled)...")
         cluster_names = label_clusters_tfidf(representatives)
 
+    logger.info("=" * 60)
+    logger.info("[6/6] Diagnosing balance + generating reports + visualization...")
+    logger.info("=" * 60)
     # ---- Step 6: Diagnose balance ----
     diagnosis = diagnose_balance(labels, len(texts))
     logger.info("=" * 60)
