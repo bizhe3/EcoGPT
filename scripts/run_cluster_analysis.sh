@@ -16,7 +16,7 @@ export HF_ENDPOINT="https://hf-mirror.com"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ---- Paths ----
-INPUT="${PROJECT_ROOT}/data/sft/train.jsonl"
+INPUT="${PROJECT_ROOT}/data/sft/train/train.jsonl"
 OUTPUT_DIR="${PROJECT_ROOT}/outputs/cluster_analysis"
 EMBED_MODEL="${PROJECT_ROOT}/models/embed/bge-large-zh-v1.5"
 LLM_MODEL="${PROJECT_ROOT}/models/base/Qwen3-14B"
