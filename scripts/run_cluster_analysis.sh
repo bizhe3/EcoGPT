@@ -10,6 +10,9 @@
 
 set -e
 
+# ---- HuggingFace China mirror ----
+export HF_ENDPOINT="https://hf-mirror.com"
+
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ---- Paths ----
@@ -52,8 +55,8 @@ fi
 
 if [ ! -d "${EMBED_MODEL}" ]; then
     echo "[INFO] BGE model not found at ${EMBED_MODEL}"
-    echo "       Downloading from HuggingFace mirror..."
-    HF_ENDPOINT=https://hf-mirror.com huggingface-cli download BAAI/bge-large-zh-v1.5 \
+    echo "       Downloading from ${HF_ENDPOINT}..."
+    huggingface-cli download BAAI/bge-large-zh-v1.5 \
         --local-dir "${EMBED_MODEL}" || {
         echo "[ERROR] Failed to download embedding model"
         exit 1
@@ -81,6 +84,7 @@ else
     echo "  LLM labels:   disabled (using TF-IDF keywords)"
 fi
 echo "  GPU count:    ${GPU_COUNT}"
+echo "  HF endpoint:  ${HF_ENDPOINT}"
 echo "============================================"
 echo ""
 
